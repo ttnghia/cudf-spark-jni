@@ -16,6 +16,7 @@
 
 #include "from_json_to_raw_map_debug.cuh"
 #include "json_utils.hpp"
+#include "nvtx_ranges.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
@@ -34,7 +35,9 @@
 
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_select.cuh>
+#include <cuda/atomic>
 #include <cuda/functional>
+#include <cuda/std/functional>
 #include <cuda/std/limits>
 #include <cuda/std/utility>
 #include <thrust/binary_search.h>
@@ -47,6 +50,7 @@
 #include <thrust/scan.h>
 #include <thrust/sequence.h>
 #include <thrust/transform.h>
+#include <thrust/uninitialized_fill.h>
 
 namespace spark_rapids_jni {
 
@@ -774,6 +778,147 @@ std::pair<rmm::device_buffer, cudf::size_type> create_null_mask(
   return {null_count > 0 ? std::move(null_mask) : rmm::device_buffer{0, stream, mr}, null_count};
 }
 
+// =====================================================================================
+// Array-value path: parse JSON `Map[String, Array[String]]` into
+// `List<Struct<String, List<String>>>`. All code below is NEW; it reuses the shared device
+// helpers above as-is and never modifies the existing `Map[String,String]` path.
+// =====================================================================================
+
+// Sentinel marking a node that is a direct element of a value array. Distinct from `key_sentinel`
+// (1) and `value_sentinel` (2) so the reused `extract_keys_or_values` can select elements.
+constexpr int8_t element_sentinel{3};
+
+// Build the empty/all-null output for an empty input: `List<Struct<String, List<String>>>` with
+// zero rows. Sibling of `make_empty_map`; the struct's value child is an empty `List<String>`
+// instead of an empty `STRING`.
+std::unique_ptr<cudf::column> make_empty_map_array(rmm::cuda_stream_view stream,
+                                                   rmm::device_async_resource_ref mr)
+{
+  auto keys   = cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
+  auto values = cudf::make_empty_lists_column(cudf::data_type{cudf::type_id::STRING});
+  std::vector<std::unique_ptr<cudf::column>> out_keys_vals;
+  out_keys_vals.emplace_back(std::move(keys));
+  out_keys_vals.emplace_back(std::move(values));
+  auto child =
+    cudf::make_structs_column(0, std::move(out_keys_vals), 0, rmm::device_buffer{}, stream, mr);
+  auto offsets = cudf::make_empty_column(cudf::data_type(cudf::type_id::INT32));
+  return cudf::make_lists_column(0, std::move(offsets), std::move(child), 0, rmm::device_buffer{});
+}
+
+// Classify each node as a value-array element and, if so, compute its de-quoted byte range and
+// element validity (mask #2: null iff it is the literal `null`). Emitted as three parallel device
+// vectors in one fused pass so the element extraction, inner offsets, and masks need no extra
+// classification pass. The de-quote logic mirrors `node_ranges_fn`/`get_token_position` for the
+// `Map[String,String]` path so element strings match the existing value semantics.
+struct element_classify_fn {
+  cudf::device_span<char const> input_json;
+  cudf::device_span<PdaTokenT const> tokens;
+  cudf::device_span<SymbolOffsetT const> token_positions;
+  cudf::device_span<NodeIndexT const> node_token_ids;
+  cudf::device_span<NodeIndexT const> parent_node_ids;
+  cudf::device_span<int8_t const> key_or_value;
+
+  // Outputs.
+  int8_t* element_flag;
+  cuda::std::pair<SymbolOffsetT, SymbolOffsetT>* element_ranges;
+  bool* element_valid;
+
+  __device__ void operator()(cudf::size_type node_id) const
+  {
+    element_flag[node_id]   = 0;
+    element_ranges[node_id] = {0, 0};
+    element_valid[node_id]  = true;
+
+    auto const token_idx = node_token_ids[node_id];
+    auto const token     = tokens[token_idx];
+
+    // Exclude error nodes; they are not array elements.
+    if (token == token_t::ErrorBegin) { return; }
+
+    // An element is a node whose parent is the value array's `ListBegin`. The value-sentinel guard
+    // is required: a nested inner `[` is also a `ListBegin`, but its parent is not value-tagged.
+    auto const parent = parent_node_ids[node_id];
+    if (parent < 0 || key_or_value[parent] != value_sentinel ||
+        tokens[node_token_ids[parent]] != token_t::ListBegin) {
+      return;
+    }
+
+    // The end-of-* partner token for a given beginning-of-* token.
+    auto const end_of_partner =
+      cuda::proclaim_return_type<token_t>([] __device__(PdaTokenT const tk) {
+        switch (tk) {
+          case token_t::StructBegin: return token_t::StructEnd;
+          case token_t::ListBegin: return token_t::ListEnd;
+          case token_t::StringBegin: return token_t::StringEnd;
+          case token_t::ValueBegin: return token_t::ValueEnd;
+          case token_t::FieldNameBegin: return token_t::FieldNameEnd;
+          default: return token_t::ErrorBegin;
+        };
+      });
+
+    // Encode a fixed value for nested node types (list+struct), used to find the matching close.
+    auto const nested_node_to_value =
+      cuda::proclaim_return_type<int32_t>([] __device__(PdaTokenT const tk) -> int32_t {
+        switch (tk) {
+          case token_t::StructBegin: return 1;
+          case token_t::StructEnd: return -1;
+          case token_t::ListBegin: return 1 << 8;
+          case token_t::ListEnd: return -(1 << 8);
+          default: return 0;
+        };
+      });
+
+    // Strip the opening/closing quote for string elements; leave literals/values verbatim.
+    auto const get_token_position = cuda::proclaim_return_type<SymbolOffsetT>(
+      [] __device__(PdaTokenT const tk, SymbolOffsetT const pos) {
+        constexpr SymbolOffsetT quote_char_size = 1;
+        switch (tk) {
+          case token_t::StringBegin: return pos + quote_char_size;
+          case token_t::StringEnd: return pos;
+          case token_t::FieldNameBegin: return pos + quote_char_size;
+          default: return pos;
+        };
+      });
+
+    auto const range_begin = get_token_position(token, token_positions[token_idx]);
+    auto range_end         = range_begin + 1;
+    if ((token_idx + 1) < tokens.size() && end_of_partner(token) == tokens[token_idx + 1]) {
+      range_end = get_token_position(tokens[token_idx + 1], token_positions[token_idx + 1]);
+    } else {
+      // Out-of-scope nested element (`[`/`{`): take the whole raw span via the close-matching
+      // accumulator, identical to the existing `node_ranges_fn` nested path.
+      auto nested_range_value = nested_node_to_value(token);
+      auto end_idx            = token_idx + 1;
+      while (end_idx < tokens.size()) {
+        nested_range_value += nested_node_to_value(tokens[end_idx]);
+        if (nested_range_value == 0) {
+          range_end = get_token_position(tokens[end_idx], token_positions[end_idx]) + 1;
+          break;
+        }
+        ++end_idx;
+      }
+      cudf_assert(nested_range_value == 0 && "Invalid element range computation.");
+    }
+
+    element_flag[node_id]   = element_sentinel;
+    element_ranges[node_id] = {range_begin, range_end};
+
+    // Mask #2: a literal `null` element is a null element. The length-4 guard distinguishes it from
+    // a 4-byte number (e.g. `1000`); a JSON STRING "null" is a StringBegin (not ValueBegin), so it
+    // stays valid. The byte compare is the only signal — the token stream carries no null literal.
+    // A null element also gets an empty byte span: it is materialized as a null string, and a
+    // non-empty span under a null entry is a non-empty null (rejected by cudf; the manual list
+    // assembly relies on the element child having no non-empty nulls).
+    if (token == token_t::ValueBegin && (range_end - range_begin) == 4) {
+      auto const* p = input_json.data() + range_begin;
+      if (p[0] == 'n' && p[1] == 'u' && p[2] == 'l' && p[3] == 'l') {
+        element_valid[node_id]  = false;
+        element_ranges[node_id] = {range_begin, range_begin};
+      }
+    }
+  }
+};
+
 }  // namespace
 
 std::unique_ptr<cudf::column> from_json_to_raw_map(cudf::strings_column_view const& input,
@@ -872,6 +1017,240 @@ std::unique_ptr<cudf::column> from_json_to_raw_map(cudf::strings_column_view con
   // on the children columns as they do not have non-empty nulls.
   std::vector<std::unique_ptr<cudf::column>> list_children;
   list_children.emplace_back(std::move(list_offsets));
+  list_children.emplace_back(std::move(structs_col));
+
+  auto [null_mask, null_count] = create_null_mask(input.size(),
+                                                  should_be_nullified,
+                                                  tokens,
+                                                  token_positions,
+                                                  node_token_ids,
+                                                  parent_node_ids,
+                                                  stream,
+                                                  mr);
+
+  return std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::LIST},
+                                        input.size(),
+                                        rmm::device_buffer{},
+                                        std::move(null_mask),
+                                        null_count,
+                                        std::move(list_children));
+}
+
+std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
+  cudf::strings_column_view const& input,
+  bool normalize_single_quotes,
+  bool allow_leading_zeros,
+  bool allow_nonnumeric_numbers,
+  bool allow_unquoted_control,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  SRJ_FUNC_RANGE();
+  if (input.is_empty()) { return make_empty_map_array(stream, mr); }
+
+  // Shared prelude, reused verbatim from `from_json_to_raw_map`.
+  auto [concat_json_buff, delimiter, should_be_nullified] = unify_json_strings(input, stream);
+  auto concat_buff_wrapper =
+    cudf::io::datasource::owning_buffer<rmm::device_buffer>(std::move(concat_json_buff));
+  if (normalize_single_quotes) {
+    cudf::io::json::detail::normalize_single_quotes(
+      concat_buff_wrapper, delimiter, stream, cudf::get_current_device_resource_ref());
+  }
+  auto const preprocessed_input = cudf::device_span<char const>(
+    reinterpret_cast<char const*>(concat_buff_wrapper.data()), concat_buff_wrapper.size());
+
+  static_assert(sizeof(SymbolT) == sizeof(char),
+                "Invalid internal data for nested json tokenizer.");
+  auto const [tokens, token_positions] = cudf::io::json::detail::get_token_stream(
+    preprocessed_input,
+    cudf::io::json_reader_options_builder{}
+      .lines(true)
+      .normalize_whitespace(false)
+      .experimental(true)
+      .mixed_types_as_string(true)
+      .recovery_mode(cudf::io::json_recovery_mode_t::RECOVER_WITH_NULL)
+      .strict_validation(true)
+      .delimiter(delimiter)
+      .numeric_leading_zeros(allow_leading_zeros)
+      .nonnumeric_numbers(allow_nonnumeric_numbers)
+      .unquoted_control_chars(allow_unquoted_control)
+      .build(),
+    stream,
+    cudf::get_current_device_resource_ref());
+
+  auto const num_nodes =
+    thrust::count_if(rmm::exec_policy_nosync(stream), tokens.begin(), tokens.end(), is_node{});
+
+  auto const node_token_ids       = compute_node_to_token_index_map(num_nodes, tokens, stream);
+  auto const parent_node_ids      = compute_parent_node_ids(tokens, node_token_ids, stream);
+  auto const is_key_or_value_node = check_key_or_value_nodes(parent_node_ids, stream);
+
+  // Key ranges reuse the existing node-range computation; element ranges are computed by the new
+  // fused classifier below. Keys are extracted exactly as in the string path.
+  auto const node_ranges = compute_node_ranges(
+    tokens, token_positions, node_token_ids, parent_node_ids, is_key_or_value_node, stream);
+  auto extracted_keys = extract_keys_or_values(
+    key_sentinel, node_ranges, is_key_or_value_node, preprocessed_input, stream, mr);
+
+  // Fused classification pass: per node emit the element flag, the de-quoted element byte range,
+  // and element validity (mask #2) in one transform.
+  auto element_flag = rmm::device_uvector<int8_t>(num_nodes, stream);
+  auto element_ranges =
+    rmm::device_uvector<cuda::std::pair<SymbolOffsetT, SymbolOffsetT>>(num_nodes, stream);
+  auto element_valid = rmm::device_uvector<bool>(num_nodes, stream);
+  {
+    auto const node_id_it = thrust::counting_iterator<cudf::size_type>(0);
+    thrust::for_each(rmm::exec_policy_nosync(stream),
+                     node_id_it,
+                     node_id_it + num_nodes,
+                     element_classify_fn{preprocessed_input,
+                                         tokens,
+                                         token_positions,
+                                         node_token_ids,
+                                         parent_node_ids,
+                                         is_key_or_value_node,
+                                         element_flag.begin(),
+                                         element_ranges.begin(),
+                                         element_valid.begin()});
+  }
+
+  // Extract element strings via the reused extractor (0-null STRING column), then attach mask #2.
+  auto extracted_elements = extract_keys_or_values(
+    element_sentinel, element_ranges, element_flag, preprocessed_input, stream, mr);
+  {
+    // Mask #2 over only the selected (element-flagged) nodes, in element document order, matching
+    // the order `extract_keys_or_values` emits.
+    auto element_validity = rmm::device_uvector<bool>(extracted_elements->size(), stream);
+    auto const is_element = cuda::proclaim_return_type<bool>(
+      [element_flag = element_flag.begin()] __device__(auto const node_id) {
+        return element_flag[node_id] == element_sentinel;
+      });
+    auto const valid_end    = copy_if(element_valid.begin(),
+                                   element_valid.end(),
+                                   thrust::make_counting_iterator(0),
+                                   element_validity.begin(),
+                                   is_element,
+                                   stream);
+    auto const num_elements = cuda::std::distance(element_validity.begin(), valid_end);
+    CUDF_EXPECTS(num_elements == extracted_elements->size(),
+                 "Invalid element validity extraction.");
+    if (num_elements > 0) {
+      auto const valid_it           = element_validity.begin();
+      auto [el_mask, el_null_count] = cudf::detail::valid_if(
+        valid_it, valid_it + num_elements, cuda::std::identity{}, stream, mr);
+      if (el_null_count > 0) {
+        extracted_elements->set_null_mask(std::move(el_mask), el_null_count);
+      }
+    }
+  }
+
+  // Outer offsets: keys per row (unchanged shape) reuses the string-path computation.
+  auto outer_offsets =
+    compute_list_offsets(input.size(), parent_node_ids, is_key_or_value_node, stream, mr);
+
+  // The struct/inner-list row count is the number of value nodes (one per map pair), which equals
+  // the key count in a well-formed map skeleton (mirrors the existing keys==values guard).
+  auto const num_values = static_cast<cudf::size_type>(
+    thrust::count_if(rmm::exec_policy_nosync(stream),
+                     is_key_or_value_node.begin(),
+                     is_key_or_value_node.end(),
+                     cuda::proclaim_return_type<bool>(
+                       [] __device__(int8_t const kv) { return kv == value_sentinel; })));
+  CUDF_EXPECTS(num_values == extracted_keys->size(),
+               "Invalid key-value pair extraction for map of arrays.");
+
+  // Value-node ordinal map: exclusive scan of the value-tagged flag over nodes. A value node's
+  // ordinal is its position among value nodes in document order, which matches the key/value
+  // extraction order.
+  auto value_ordinals = rmm::device_uvector<cudf::size_type>(num_nodes, stream);
+  {
+    auto const value_flag_it =
+      thrust::make_transform_iterator(is_key_or_value_node.begin(),
+                                      cuda::proclaim_return_type<cudf::size_type>(
+                                        [] __device__(int8_t const kv) -> cudf::size_type {
+                                          return kv == value_sentinel ? 1 : 0;
+                                        }));
+    thrust::exclusive_scan(rmm::exec_policy_nosync(stream),
+                           value_flag_it,
+                           value_flag_it + num_nodes,
+                           value_ordinals.begin());
+  }
+
+  // Inner offsets: per value node, the number of its array elements. Length is `num_values + 1`;
+  // a null/scalar/object value is still a value node and contributes a 0-count slot (its inner
+  // list is masked null below, but the offset slot must exist).
+  auto inner_offsets = rmm::device_uvector<cudf::size_type>(num_values + 1, stream, mr);
+  thrust::uninitialized_fill(
+    rmm::exec_policy_nosync(stream), inner_offsets.begin(), inner_offsets.end(), 0);
+  {
+    auto const node_id_it = thrust::counting_iterator<cudf::size_type>(0);
+    thrust::for_each(rmm::exec_policy_nosync(stream),
+                     node_id_it,
+                     node_id_it + num_nodes,
+                     [element_flag   = element_flag.begin(),
+                      parent_ids     = parent_node_ids.begin(),
+                      value_ordinals = value_ordinals.begin(),
+                      counts         = inner_offsets.begin()] __device__(auto const node_id) {
+                       if (element_flag[node_id] != element_sentinel) { return; }
+                       // The element's parent is the value array's `ListBegin` node.
+                       auto const value_node = parent_ids[node_id];
+                       auto ref = cuda::atomic_ref<cudf::size_type, cuda::thread_scope_device>{
+                         counts[value_ordinals[value_node]]};
+                       ref.fetch_add(1, cuda::memory_order_relaxed);
+                     });
+    thrust::exclusive_scan(rmm::exec_policy_nosync(stream),
+                           inner_offsets.begin(),
+                           inner_offsets.end(),
+                           inner_offsets.begin());
+  }
+
+  // Mask #1 (inner-list validity): per value node, null iff its token is not `ListBegin`
+  // (null/scalar/object value). Indexed by value-node ordinal, matching the keys/values order.
+  auto inner_valid = rmm::device_uvector<bool>(num_values, stream);
+  {
+    auto const node_id_it = thrust::counting_iterator<cudf::size_type>(0);
+    thrust::for_each(rmm::exec_policy_nosync(stream),
+                     node_id_it,
+                     node_id_it + num_nodes,
+                     [key_or_value   = is_key_or_value_node.begin(),
+                      tokens         = tokens.begin(),
+                      node_token_ids = node_token_ids.begin(),
+                      value_ordinals = value_ordinals.begin(),
+                      inner_valid    = inner_valid.begin()] __device__(auto const node_id) {
+                       if (key_or_value[node_id] != value_sentinel) { return; }
+                       inner_valid[value_ordinals[node_id]] =
+                         tokens[node_token_ids[node_id]] == token_t::ListBegin;
+                     });
+  }
+
+  // Assemble the inner `List<String>` (the struct's value child) with manual column construction,
+  // mirroring the string path: the public factory would launch a `purge_nonempty_nulls` scan, but
+  // the inner list carries nulls by design (mask #1) and the element child has no non-empty nulls.
+  auto [inner_mask, inner_null_count] = cudf::detail::valid_if(
+    inner_valid.begin(), inner_valid.end(), cuda::std::identity{}, stream, mr);
+  auto inner_offsets_col =
+    std::make_unique<cudf::column>(std::move(inner_offsets), rmm::device_buffer{}, 0);
+  std::vector<std::unique_ptr<cudf::column>> inner_list_children;
+  inner_list_children.emplace_back(std::move(inner_offsets_col));
+  inner_list_children.emplace_back(std::move(extracted_elements));
+  auto inner_list = std::make_unique<cudf::column>(
+    cudf::data_type{cudf::type_id::LIST},
+    num_values,
+    rmm::device_buffer{},
+    inner_null_count > 0 ? std::move(inner_mask) : rmm::device_buffer{},
+    inner_null_count > 0 ? inner_null_count : 0,
+    std::move(inner_list_children));
+
+  // Struct child: <key STRING, value List<String>>.
+  std::vector<std::unique_ptr<cudf::column>> out_keys_vals;
+  out_keys_vals.emplace_back(std::move(extracted_keys));
+  out_keys_vals.emplace_back(std::move(inner_list));
+  auto structs_col = cudf::make_structs_column(
+    num_values, std::move(out_keys_vals), 0, rmm::device_buffer{}, stream, mr);
+
+  // Outer list assembly, mirroring the string path's manual construction.
+  std::vector<std::unique_ptr<cudf::column>> list_children;
+  list_children.emplace_back(std::move(outer_offsets));
   list_children.emplace_back(std::move(structs_col));
 
   auto [null_mask, null_count] = create_null_mask(input.size(),
