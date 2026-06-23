@@ -18,19 +18,25 @@
 
 #include <cudf_test/column_wrapper.hpp>
 
+#include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/io/json.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/lists/lists_column_view.hpp>
+#include <cudf/strings/detail/strings_children.cuh>
 #include <cudf/strings/split/split.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/device_buffer.hpp>
 
 #include <json_utils.hpp>
 #include <nvbench/nvbench.cuh>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -52,17 +58,16 @@ std::vector<cudf::type_id> make_all_string_column_types(int num_keys)
 // Generate a strings column where each row is one FLAT JSON object whose scalar fields take the
 // caller-supplied `column_types`. The number of keys is `column_types.size()`.
 //
-// `create_random_table` is deterministic (fixed default seed = 1), so calling this helper with the
-// same arguments yields byte-identical input.
+// `create_random_table` is deterministic (fixed default seed = 1), so the same arguments always
+// yield the same input.
 //
-// Tunable parameters (all defaulted so existing 2-arg call sites stay byte-identical to before):
+// Tunable parameters:
 //   - `value_width`  : exact width of every generated STRING value (NORMAL dist, lower==upper).
 //   - `null_pct`     : if > 0, fraction of null elements per column; if 0, no null mask at all.
 //   - `key_name_len` : if <= 0, keys are "col0".."colN-1"; if > 0, keys are EXACTLY `key_name_len`
 //                      chars ("k" + zero-padded i) so longer key names can be exercised.
 //   - `row_count`    : if > 0, the table is sized by row count and `size_bytes` is ignored; else
-//   the
-//                      table is sized by target byte count via `table_size_bytes`.
+//   the table is sized by target byte count via `table_size_bytes`.
 //
 // `write_json(lines=true)` appends a trailing newline, so splitting on "\n" produces a trailing
 // empty string (a spurious extra row). We slice it off below before returning.
@@ -150,80 +155,121 @@ std::size_t input_char_bytes(cudf::column_view const& json_strings)
   return static_cast<std::size_t>(cudf::strings_column_view{json_strings}.chars_size(stream));
 }
 
-// Deterministic fixed-width string element: `width` printable ASCII chars cycling 'a'..'z' offset
-// by `seed`, so identical (width, seed) always yields the same bytes. Keeps the JSON simple (no
-// chars that would need escaping) while giving the value arrays distinct, non-degenerate content.
-std::string make_element(int width, std::size_t seed)
+// Upper bound for the deterministically varied width of every generated key and array-element
+// string. A constexpr so the range is trivially adjustable.
+constexpr cudf::size_type max_string_width = 20;
+
+// SplitMix64 finalizer: a cheap, well-distributed hash used to spread token widths across
+// [1, max_string_width] so generated keys and elements are not all the same length.
+__device__ inline std::uint64_t hash_index(std::uint64_t x)
 {
-  std::string s(static_cast<std::size_t>(width), 'a');
-  for (std::size_t c = 0; c < static_cast<std::size_t>(width); ++c) {
-    s[c] = static_cast<char>('a' + (seed + c) % 26);
-  }
-  return s;
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
 }
 
-// Generate a strings column where each row is one JSON object mapping `keys_per_row` string keys
-// ("k0".."kN-1", mirroring generate_input's col0..colN-1 convention) to JSON arrays of strings,
-// e.g. {"k0":["...","..."],"k1":[...],...}. Targets `from_json_to_raw_map_array_values`.
-//
-// Built deterministically host-side rather than via create_random_table: cudf's data_profile has a
-// single null_probability shared by a list column and its string child, so it cannot independently
-// drive value-level nulls (whole array null, mask #1) and element-level nulls (mask #2); explicit
-// host construction gives byte-identical output and independent control of both masks.
-//
-//   - `array_len`        : number of string elements in every value array (fixed per cell);
-//   - `element_width`    : exact width of each string element;
-//   - `element_null_pct` : fraction of array elements emitted as the literal `null` (mask #2);
-//   - `value_null_pct`   : fraction of values emitted as literal `null` instead of an array,
-//                          producing a null inner list (mask #1).
-// Null placement is deterministic (every Nth element/value) so the fractions are reproducible.
+// Builds one JSON object row `{"<key>":["<elem>",...],...}` for the map-of-array engine. Every key
+// and element is a quoted token whose width varies in [1, max_string_width] and whose content is a
+// deterministic function of its index. A value is the literal `null` (null inner list, mask #1) at
+// `value_null_stride`; an element is the literal `null` (null element, mask #2) at
+// `element_null_stride`. The same code path computes the row size (when `d_chars == nullptr`) and
+// writes the bytes, so the two passes cannot disagree.
+struct map_of_array_row_fn {
+  cudf::size_type keys_per_row;
+  cudf::size_type array_len;
+  cudf::size_type value_null_stride;    // 0 disables; else value null when index % stride == 0
+  cudf::size_type element_null_stride;  // 0 disables; else element null when index % stride == 0
+
+  cudf::size_type* d_sizes{};
+  char* d_chars{};
+  cudf::detail::input_offsetalator d_offsets;
+
+  // Elements draw from a different content stream than keys so a key never mirrors its own element.
+  static constexpr std::uint64_t element_seed_salt = 0x1000003ULL;
+
+  __device__ void operator()(cudf::size_type row) const
+  {
+    char* out         = d_chars ? d_chars + d_offsets[row] : nullptr;
+    cudf::size_type n = 0;
+
+    auto emit = [&](char c) {
+      if (out) { out[n] = c; }
+      ++n;
+    };
+    auto emit_literal = [&](char const* s) {
+      for (; *s != '\0'; ++s) {
+        emit(*s);
+      }
+    };
+    // A quoted token of 1..max_string_width lowercase chars, seeded deterministically by `seed`.
+    auto emit_token = [&](std::uint64_t seed) {
+      auto const width = static_cast<cudf::size_type>(1 + hash_index(seed) % max_string_width);
+      emit('"');
+      for (cudf::size_type c = 0; c < width; ++c) {
+        emit(static_cast<char>('a' + (seed + c) % 26));
+      }
+      emit('"');
+    };
+
+    emit('{');
+    for (cudf::size_type k = 0; k < keys_per_row; ++k) {
+      if (k > 0) { emit(','); }
+      auto const key_index = static_cast<std::uint64_t>(row) * keys_per_row + k;
+      emit_token(key_index);
+      emit(':');
+      if (value_null_stride != 0 && key_index % value_null_stride == 0) {
+        emit_literal("null");
+        continue;
+      }
+      emit('[');
+      for (cudf::size_type e = 0; e < array_len; ++e) {
+        if (e > 0) { emit(','); }
+        auto const element_index = key_index * array_len + e;
+        if (element_null_stride != 0 && element_index % element_null_stride == 0) {
+          emit_literal("null");
+        } else {
+          emit_token(element_index + element_seed_salt);
+        }
+      }
+      emit(']');
+    }
+    emit('}');
+
+    if (out == nullptr) { d_sizes[row] = n; }
+  }
+};
+
+// Generate a strings column where each row is one JSON object mapping `keys_per_row` keys to JSON
+// arrays of `array_len` strings, targeting `from_json_to_raw_map_array_values`. Key and element
+// widths vary in [1, max_string_width]. `element_null_pct` / `value_null_pct` inject literal `null`
+// elements (mask #2) / values, i.e. null inner lists (mask #1), at a fixed cadence. The column is
+// built entirely on the GPU, so large row counts stay cheap.
 std::unique_ptr<cudf::column> generate_map_of_array_input(std::size_t num_rows,
                                                           int keys_per_row,
                                                           int array_len,
-                                                          int element_width,
                                                           double element_null_pct = 0.0,
                                                           double value_null_pct   = 0.0)
 {
-  // Convert a fraction in [0,1] to a deterministic "1 in `stride`" cadence; 0 disables nulls.
-  auto const value_stride =
-    value_null_pct > 0.0 ? std::max(1, static_cast<int>(1.0 / value_null_pct)) : 0;
-  auto const element_stride =
-    element_null_pct > 0.0 ? std::max(1, static_cast<int>(1.0 / element_null_pct)) : 0;
+  // Convert a fraction in [0,1] to a deterministic "1 in stride" cadence; 0 disables nulls.
+  auto const to_stride = [](double pct) {
+    return pct > 0.0 ? std::max(1, static_cast<int>(1.0 / pct)) : 0;
+  };
 
-  std::vector<std::string> rows(num_rows);
-  std::size_t element_counter = 0;
-  std::size_t value_counter   = 0;
-  for (std::size_t r = 0; r < num_rows; ++r) {
-    std::string obj;
-    obj.push_back('{');
-    for (int k = 0; k < keys_per_row; ++k) {
-      if (k > 0) { obj.push_back(','); }
-      obj += "\"k" + std::to_string(k) + "\":";
-      auto const value_is_null = value_stride != 0 && (value_counter++ % value_stride == 0);
-      if (value_is_null) {
-        obj += "null";
-        continue;
-      }
-      obj.push_back('[');
-      for (int e = 0; e < array_len; ++e) {
-        if (e > 0) { obj.push_back(','); }
-        auto const element_is_null = element_stride != 0 && (element_counter % element_stride == 0);
-        if (element_is_null) {
-          obj += "null";
-        } else {
-          obj.push_back('"');
-          obj += make_element(element_width, element_counter);
-          obj.push_back('"');
-        }
-        ++element_counter;
-      }
-      obj.push_back(']');
-    }
-    obj.push_back('}');
-    rows[r] = std::move(obj);
-  }
+  map_of_array_row_fn fn{static_cast<cudf::size_type>(keys_per_row),
+                         static_cast<cudf::size_type>(array_len),
+                         static_cast<cudf::size_type>(to_stride(value_null_pct)),
+                         static_cast<cudf::size_type>(to_stride(element_null_pct))};
 
-  return cudf::test::strings_column_wrapper(rows.begin(), rows.end()).release();
+  auto const stream     = cudf::get_default_stream();
+  auto const mr         = cudf::get_current_device_resource_ref();
+  auto [offsets, chars] = cudf::strings::detail::make_strings_children(
+    fn, static_cast<cudf::size_type>(num_rows), stream, mr);
+  return cudf::make_strings_column(static_cast<cudf::size_type>(num_rows),
+                                   std::move(offsets),
+                                   chars.release(),
+                                   0,
+                                   rmm::device_buffer{});
 }
 
 }  // namespace
@@ -357,32 +403,11 @@ void BM_from_json_to_raw_map_key_name_len(nvbench::state& state)
 // HEADLINE: map-of-array vs array length and row count.
 void BM_from_json_to_raw_map_array_values(nvbench::state& state)
 {
-  auto const array_len        = static_cast<int>(state.get_int64("array_len"));
-  auto const num_rows         = static_cast<std::size_t>(state.get_int64("num_rows"));
-  constexpr int keys_per_row  = 5;
-  constexpr int element_width = 10;
+  auto const array_len       = static_cast<int>(state.get_int64("array_len"));
+  auto const num_rows        = static_cast<std::size_t>(state.get_int64("num_rows"));
+  constexpr int keys_per_row = 5;
 
-  auto const json_strings =
-    generate_map_of_array_input(num_rows, keys_per_row, array_len, element_width);
-
-  state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
-  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
-    [[maybe_unused]] auto const output = spark_rapids_jni::from_json_to_raw_map_array_values(
-      cudf::strings_column_view{json_strings->view()}, false, true, true, false);
-  });
-  state.add_global_memory_reads<nvbench::int8_t>(input_char_bytes(json_strings->view()));
-}
-
-// Scenario: map-of-array vs string element width.
-void BM_from_json_to_raw_map_array_values_element_width(nvbench::state& state)
-{
-  auto const element_width       = static_cast<int>(state.get_int64("element_width"));
-  constexpr std::size_t num_rows = 1'000'000;
-  constexpr int array_len        = 3;
-  constexpr int keys_per_row     = 5;
-
-  auto const json_strings =
-    generate_map_of_array_input(num_rows, keys_per_row, array_len, element_width);
+  auto const json_strings = generate_map_of_array_input(num_rows, keys_per_row, array_len);
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
@@ -400,10 +425,9 @@ void BM_from_json_to_raw_map_array_values_null_density(nvbench::state& state)
   constexpr std::size_t num_rows = 1'000'000;
   constexpr int array_len        = 3;
   constexpr int keys_per_row     = 5;
-  constexpr int element_width    = 10;
 
-  auto const json_strings = generate_map_of_array_input(
-    num_rows, keys_per_row, array_len, element_width, null_pct, null_pct);
+  auto const json_strings =
+    generate_map_of_array_input(num_rows, keys_per_row, array_len, null_pct, null_pct);
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
@@ -419,10 +443,8 @@ void BM_from_json_to_raw_map_array_values_keys_per_row(nvbench::state& state)
   auto const keys_per_row        = static_cast<int>(state.get_int64("keys_per_row"));
   constexpr std::size_t num_rows = 1'000'000;
   constexpr int array_len        = 3;
-  constexpr int element_width    = 10;
 
-  auto const json_strings =
-    generate_map_of_array_input(num_rows, keys_per_row, array_len, element_width);
+  auto const json_strings = generate_map_of_array_input(num_rows, keys_per_row, array_len);
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
@@ -461,10 +483,6 @@ NVBENCH_BENCH(BM_from_json_to_raw_map_array_values)
   .set_name("from_json_to_raw_map_array_values")
   .add_int64_axis("array_len", {1, 3, 10})
   .add_int64_axis("num_rows", {100'000, 1'000'000, 10'000'000});
-
-NVBENCH_BENCH(BM_from_json_to_raw_map_array_values_element_width)
-  .set_name("from_json_to_raw_map_array_values_element_width")
-  .add_int64_axis("element_width", {1, 10, 100});
 
 NVBENCH_BENCH(BM_from_json_to_raw_map_array_values_null_density)
   .set_name("from_json_to_raw_map_array_values_null_density")
