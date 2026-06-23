@@ -19,6 +19,7 @@
 #include "nvtx_ranges.hpp"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/valid_if.cuh>
 #include <cudf/io/detail/json.hpp>
@@ -1253,6 +1254,68 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
   list_children.emplace_back(std::move(outer_offsets));
   list_children.emplace_back(std::move(structs_col));
 
+  // Row-level bad-record semantics (Spark `from_json`): if ANY value node in a row is a HARD TYPE
+  // MISMATCH the whole row is nullified. A hard mismatch is a value node whose token is neither
+  // `ListBegin` (a valid array) nor the JSON `null` literal (a kept row with a null inner list).
+  // We fold this into `should_be_nullified` BEFORE `create_null_mask` so the existing row null-mask
+  // computation (which already incorporates null/empty/invalid-JSON rows) absorbs it with the
+  // correct `null_count`. The JSON-null literal check mirrors the element-level mask #2 predicate
+  // in `element_classify_fn` (a `ValueBegin` whose de-quoted byte range is exactly the 4 bytes
+  // `null`); here the value node's `node_ranges` entry carries the same de-quoted range. Node->row
+  // is found by binary-searching the sorted line-begin `StructBegin` node ids (one per row),
+  // mirroring `create_null_mask`: a value node is a strict descendant of the last line-begin id not
+  // exceeding it.
+  {
+    auto const node_id_it = thrust::counting_iterator<NodeIndexT>(0);
+
+    // Sorted list of line-begin StructBegin node ids (one per input row), mirroring
+    // `create_null_mask`. A value node's row is the last line-begin id not exceeding it.
+    rmm::device_uvector<NodeIndexT> line_begin_indices(num_nodes, stream);
+    auto const line_begin_copy_end = copy_if(node_id_it,
+                                             node_id_it + num_nodes,
+                                             line_begin_indices.begin(),
+                                             is_line_begin{tokens, node_token_ids, parent_node_ids},
+                                             stream);
+    auto const num_line_begin =
+      cuda::std::distance(line_begin_indices.begin(), line_begin_copy_end);
+    CUDF_EXPECTS(num_line_begin == input.size(), "Incorrect count of JSON objects.");
+
+    thrust::for_each(
+      rmm::exec_policy_nosync(stream),
+      node_id_it,
+      node_id_it + num_nodes,
+      [key_or_value       = is_key_or_value_node.begin(),
+       tokens             = tokens.begin(),
+       node_token_ids     = node_token_ids.begin(),
+       node_ranges        = node_ranges.begin(),
+       input_json         = preprocessed_input.data(),
+       line_begin_indices = line_begin_indices.begin(),
+       num_rows           = input.size(),
+       should_be_nullified =
+         should_be_nullified->mutable_view().begin<bool>()] __device__(NodeIndexT const node_id) {
+        if (key_or_value[node_id] != value_sentinel) { return; }
+        auto const token = tokens[node_token_ids[node_id]];
+        if (token == token_t::ListBegin) { return; }  // valid array.
+        // Keep the row for a JSON `null` literal value: a `ValueBegin` whose de-quoted byte range
+        // is exactly the 4 bytes `null` (a JSON STRING "null" is a `StringBegin`, so it does not
+        // match and is treated as a hard mismatch, matching Spark).
+        if (token == token_t::ValueBegin) {
+          auto const range = node_ranges[node_id];
+          if ((range.second - range.first) == 4) {
+            auto const* p = input_json + range.first;
+            if (p[0] == 'n' && p[1] == 'u' && p[2] == 'l' && p[3] == 'l') { return; }
+          }
+        }
+        // Hard type mismatch (scalar string/number/bool, object, or any non-array, non-null value):
+        // nullify the entire row. Row = last line-begin id not exceeding `node_id`.
+        auto const row_idx =
+          thrust::upper_bound(
+            thrust::seq, line_begin_indices, line_begin_indices + num_rows, node_id) -
+          line_begin_indices - 1;
+        should_be_nullified[row_idx] = true;
+      });
+  }
+
   auto [null_mask, null_count] = create_null_mask(input.size(),
                                                   should_be_nullified,
                                                   tokens,
@@ -1262,12 +1325,22 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
                                                   stream,
                                                   mr);
 
-  return std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::LIST},
-                                        input.size(),
-                                        rmm::device_buffer{},
-                                        std::move(null_mask),
-                                        null_count,
-                                        std::move(list_children));
+  auto result = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::LIST},
+                                               input.size(),
+                                               rmm::device_buffer{},
+                                               std::move(null_mask),
+                                               null_count,
+                                               std::move(list_children));
+
+  // A row nulled for a hard value type mismatch still spans the key/value pairs that were
+  // materialized before the mismatch was detected, so the outer list can carry non-empty nulls.
+  // This manual assembly skips the factory's `purge_nonempty_nulls` scan, so sanitize the outer
+  // list here (the children are already empty under their nulls by construction). Gated on a cheap
+  // check so the common all-valid / empty-null paths keep the zero-copy build.
+  if (null_count > 0 && cudf::has_nonempty_nulls(result->view(), stream)) {
+    return cudf::purge_nonempty_nulls(result->view(), stream, mr);
+  }
+  return result;
 }
 
 }  // namespace spark_rapids_jni

@@ -442,7 +442,9 @@ TEST_F(FromJsonTest, RawMapOpt_StressInvariantsWithBadRows)
 // the documented raw/de-quote behaviour with `include_quote_char=false`):
 //   * value = JSON array of strings -> non-null inner List<String> of de-quoted elements.
 //   * value = `[]` -> empty (non-null) inner list.
-//   * value = null / scalar / object (NOT an array) -> NULL inner list (mask #1).
+//   * value = JSON `null` literal -> row KEPT, NULL inner list (mask #1).
+//   * value = scalar / object (present, non-null, NOT an array) -> HARD TYPE MISMATCH: the WHOLE
+//     row is nullified (Spark row-level bad-record semantics), even if other keys are valid arrays.
 //   * element = string -> de-quoted bytes; number/bool/nested -> raw JSON substring.
 //   * element = literal `null` -> NULL element (mask #2); a JSON STRING "null" stays valid.
 // ===========================================================================
@@ -606,15 +608,38 @@ TEST_F(FromJsonTest, RawMapArray_EmptyObject)
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(*raw_map_array(input), *expected);
 }
 
-// value = null / scalar / object (NOT an array) -> NULL inner list (mask #1).
+// Spark row-level bad-record semantics for non-array values:
+//   * value = JSON `null` literal -> row KEPT, inner list null (mask #1).
+//   * value = scalar (string/number) or object (NOT an array, NOT null) -> WHOLE ROW null.
+// Each case is its own row so the kept-vs-nullified rows are pinned independently.
 TEST_F(FromJsonTest, RawMapArray_NonArrayValuesNullInnerList)
 {
+  auto const input_col = cudf::test::strings_column_wrapper{
+    R"({"a":null})", R"({"a":"s"})", R"({"a":9})", R"({"a":{"x":"y"}})"};
+  auto const input = cudf::strings_column_view{input_col};
+
+  // Row 0 kept (null inner list); rows 1-3 are hard type mismatches -> whole row null. The pairs of
+  // the nullified rows are ignored by `make_expected_raw_map_array`, so their content is
+  // irrelevant.
+  auto const expected = make_expected_raw_map_array(
+    {{{"a", null_arr()}}, {{"a", null_arr()}}, {{"a", null_arr()}}, {{"a", null_arr()}}},
+    {true, false, false, false});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*raw_map_array(input), *expected);
+}
+
+// Row-level bad-record semantics across MULTI-KEY rows: a hard type mismatch in ANY value nulls the
+// entire row even when other keys hold valid arrays; a JSON `null` value keeps the row.
+//   * `{"a":["x"],"b":"s"}` -> WHOLE ROW null (even though `a` is a valid array).
+//   * `{"a":["x"],"b":null}` -> row KEPT: `{a:[x], b:null}`.
+TEST_F(FromJsonTest, RawMapArray_TypeMismatchValueNullsRow)
+{
   auto const input_col =
-    cudf::test::strings_column_wrapper{R"({"a":null,"b":["x"],"c":42,"d":{"nested":"obj"}})"};
+    cudf::test::strings_column_wrapper{R"({"a":["x"],"b":"s"})", R"({"a":["x"],"b":null})"};
   auto const input = cudf::strings_column_view{input_col};
 
   auto const expected = make_expected_raw_map_array(
-    {{{"a", null_arr()}, {"b", arr({"x"})}, {"c", null_arr()}, {"d", null_arr()}}}, all_valid(1));
+    {{{"a", arr({"x"})}, {"b", null_arr()}}, {{"a", arr({"x"})}, {"b", null_arr()}}},
+    {false, true});
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(*raw_map_array(input), *expected);
 }
 
