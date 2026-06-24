@@ -26,6 +26,7 @@
 #include <cudf/io/detail/tokenize_json.hpp>
 #include <cudf/strings/detail/strings_children.cuh>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/transform.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
@@ -1172,11 +1173,10 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
     CUDF_EXPECTS(num_elements == extracted_elements->size(),
                  "Invalid element validity extraction.");
     if (num_elements > 0) {
-      auto const valid_it           = element_validity.begin();
-      auto [el_mask, el_null_count] = cudf::detail::valid_if(
-        valid_it, valid_it + num_elements, cuda::std::identity{}, stream, mr);
+      auto [el_mask, el_null_count] = cudf::bools_to_mask(
+        cudf::device_span<bool const>(element_validity.data(), num_elements), stream, mr);
       if (el_null_count > 0) {
-        extracted_elements->set_null_mask(std::move(el_mask), el_null_count);
+        extracted_elements->set_null_mask(std::move(*el_mask), el_null_count);
       }
     }
   }
@@ -1268,8 +1268,8 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
   // Assemble the inner `List<String>` (the struct's value child) by hand: the public factory would
   // launch a `purge_nonempty_nulls` scan, but the inner list carries nulls by design (mask #1) and
   // its element child has no non-empty nulls.
-  auto [inner_mask, inner_null_count] = cudf::detail::valid_if(
-    inner_valid.begin(), inner_valid.end(), cuda::std::identity{}, stream, mr);
+  auto [inner_mask, inner_null_count] =
+    cudf::bools_to_mask(cudf::device_span<bool const>(inner_valid), stream, mr);
   auto inner_offsets_col =
     std::make_unique<cudf::column>(std::move(inner_offsets), rmm::device_buffer{}, 0);
   std::vector<std::unique_ptr<cudf::column>> inner_list_children;
@@ -1279,7 +1279,7 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
     cudf::data_type{cudf::type_id::LIST},
     num_values,
     rmm::device_buffer{},
-    inner_null_count > 0 ? std::move(inner_mask) : rmm::device_buffer{},
+    inner_null_count > 0 ? std::move(*inner_mask) : rmm::device_buffer{},
     inner_null_count > 0 ? inner_null_count : 0,
     std::move(inner_list_children));
 

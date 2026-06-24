@@ -25,6 +25,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/structs/structs_column_view.hpp>
+#include <cudf/transform.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
 
@@ -97,14 +98,14 @@ std::unique_ptr<cudf::column> make_expected_raw_map(std::vector<std::vector<kv>>
     cudf::test::fixed_width_column_wrapper<cudf::size_type>(offsets.begin(), offsets.end())
       .release();
 
-  auto [null_mask, null_count] =
-    cudf::test::detail::make_null_mask(row_valid.begin(), row_valid.end());
+  auto [null_mask, null_count] = cudf::bools_to_mask(
+    cudf::test::fixed_width_column_wrapper<bool>(row_valid.begin(), row_valid.end()));
 
   return cudf::make_lists_column(num_rows,
                                  std::move(offsets_col),
                                  std::move(structs_child),
                                  null_count,
-                                 null_count > 0 ? std::move(null_mask) : rmm::device_buffer{});
+                                 null_count > 0 ? std::move(*null_mask) : rmm::device_buffer{});
 }
 
 // Convenience: every row valid.
@@ -561,15 +562,15 @@ std::unique_ptr<cudf::column> make_expected_raw_map_array(std::vector<std::vecto
                              inner_offsets.begin(), inner_offsets.end())
                              .release();
 
-  auto [inner_mask, inner_null_count] =
-    cudf::test::detail::make_null_mask(inner_valid.begin(), inner_valid.end());
+  auto [inner_mask, inner_null_count] = cudf::bools_to_mask(
+    cudf::test::fixed_width_column_wrapper<bool>(inner_valid.begin(), inner_valid.end()));
 
   auto inner_list =
     cudf::make_lists_column(num_pairs,
                             std::move(inner_offsets_col),
                             elements_child.release(),
                             inner_null_count,
-                            inner_null_count > 0 ? std::move(inner_mask) : rmm::device_buffer{});
+                            inner_null_count > 0 ? std::move(*inner_mask) : rmm::device_buffer{});
 
   std::vector<std::unique_ptr<cudf::column>> struct_children;
   struct_children.emplace_back(keys_child.release());
@@ -581,15 +582,15 @@ std::unique_ptr<cudf::column> make_expected_raw_map_array(std::vector<std::vecto
                              outer_offsets.begin(), outer_offsets.end())
                              .release();
 
-  auto [outer_mask, outer_null_count] =
-    cudf::test::detail::make_null_mask(row_valid.begin(), row_valid.end());
+  auto [outer_mask, outer_null_count] = cudf::bools_to_mask(
+    cudf::test::fixed_width_column_wrapper<bool>(row_valid.begin(), row_valid.end()));
 
   return cudf::make_lists_column(
     num_rows,
     std::move(outer_offsets_col),
     std::move(structs_child),
     outer_null_count,
-    outer_null_count > 0 ? std::move(outer_mask) : rmm::device_buffer{});
+    outer_null_count > 0 ? std::move(*outer_mask) : rmm::device_buffer{});
 }
 
 // Convenience builders for `array_value` literals.

@@ -20,19 +20,26 @@
 
 #include <cudf_test/column_wrapper.hpp>
 
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/io/json.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/lists/lists_column_view.hpp>
-#include <cudf/strings/detail/strings_children.cuh>
 #include <cudf/strings/split/split.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
-#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
+#include <rmm/exec_policy.hpp>
+
+#include <cuda/functional>
+#include <thrust/for_each.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/scan.h>
 
 #include <nvbench/nvbench.cuh>
 
@@ -188,7 +195,7 @@ struct map_of_array_row_fn {
 
   cudf::size_type* d_sizes{};
   char* d_chars{};
-  cudf::detail::input_offsetalator d_offsets;
+  int64_t const* d_offsets{};
 
   // Elements and scalar mismatch values draw from different content streams than keys so neither
   // mirrors the key it sits next to.
@@ -281,15 +288,40 @@ std::unique_ptr<cudf::column> generate_map_of_array_input(std::size_t num_rows,
                          .mismatch_stride     = to_stride(mismatch_pct),
                          .key_len             = static_cast<cudf::size_type>(key_name_len)};
 
-  auto const stream     = cudf::get_default_stream();
-  auto const mr         = cudf::get_current_device_resource_ref();
-  auto [offsets, chars] = cudf::strings::detail::make_strings_children(
-    fn, static_cast<cudf::size_type>(num_rows), stream, mr);
-  return cudf::make_strings_column(static_cast<cudf::size_type>(num_rows),
-                                   std::move(offsets),
-                                   chars.release(),
-                                   0,
-                                   rmm::device_buffer{});
+  auto const stream    = cudf::get_default_stream();
+  auto const row_count = static_cast<cudf::size_type>(num_rows);
+
+  // Size pass: each row's byte count fits in size_type, so accumulate per-row sizes in size_type.
+  rmm::device_uvector<cudf::size_type> sizes(num_rows, stream);
+  fn.d_chars = nullptr;
+  fn.d_sizes = sizes.data();
+  thrust::for_each_n(
+    rmm::exec_policy(stream), thrust::counting_iterator<cudf::size_type>{0}, row_count, fn);
+
+  // Offsets must be int64: at the largest axis the total byte count exceeds INT32_MAX, so an int32
+  // scan would overflow. Scan row_count+1 inputs (the trailing element reads 0) into an int64
+  // buffer so the prefix sum accumulates in int64 and the final offset holds the total byte count.
+  rmm::device_uvector<int64_t> offsets(num_rows + 1, stream);
+  auto const sizes_in = thrust::make_transform_iterator(
+    thrust::counting_iterator<cudf::size_type>{0},
+    cuda::proclaim_return_type<int64_t>(
+      [d_sizes = sizes.data(), row_count] __device__(cudf::size_type i) -> int64_t {
+        return i < row_count ? static_cast<int64_t>(d_sizes[i]) : int64_t{0};
+      }));
+  thrust::exclusive_scan(
+    rmm::exec_policy(stream), sizes_in, sizes_in + (num_rows + 1), offsets.begin(), int64_t{0});
+  auto const total_bytes = offsets.element(num_rows, stream);
+
+  // Char pass: write each row's bytes at d_chars + d_offsets[row].
+  rmm::device_uvector<char> chars(total_bytes, stream);
+  fn.d_chars   = chars.data();
+  fn.d_offsets = offsets.data();
+  thrust::for_each_n(
+    rmm::exec_policy(stream), thrust::counting_iterator<cudf::size_type>{0}, row_count, fn);
+
+  auto offsets_col = std::make_unique<cudf::column>(std::move(offsets), rmm::device_buffer{}, 0);
+  return cudf::make_strings_column(
+    row_count, std::move(offsets_col), chars.release(), 0, rmm::device_buffer{});
 }
 
 }  // namespace
