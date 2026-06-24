@@ -144,18 +144,28 @@ OutputIterator copy_if(InputIterator begin,
   return output + num_selected.value(stream);
 }
 
-std::unique_ptr<cudf::column> make_empty_map(rmm::cuda_stream_view stream,
-                                             rmm::device_async_resource_ref mr)
+// Build a zero-row `List<Struct<String, V>>` from an already-constructed empty value child. The
+// value-child type selects the map flavor: an empty `STRING` gives `make_empty_map`'s output, an
+// empty `List<String>` gives `make_empty_map_array`'s.
+std::unique_ptr<cudf::column> make_empty_map_with_value(std::unique_ptr<cudf::column> value_child,
+                                                        rmm::cuda_stream_view stream,
+                                                        rmm::device_async_resource_ref mr)
 {
-  auto keys   = cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
-  auto values = cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
+  auto keys = cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
   std::vector<std::unique_ptr<cudf::column>> out_keys_vals;
   out_keys_vals.emplace_back(std::move(keys));
-  out_keys_vals.emplace_back(std::move(values));
+  out_keys_vals.emplace_back(std::move(value_child));
   auto child =
     cudf::make_structs_column(0, std::move(out_keys_vals), 0, rmm::device_buffer{}, stream, mr);
   auto offsets = cudf::make_empty_column(cudf::data_type(cudf::type_id::INT32));
   return cudf::make_lists_column(0, std::move(offsets), std::move(child), 0, rmm::device_buffer{});
+}
+
+std::unique_ptr<cudf::column> make_empty_map(rmm::cuda_stream_view stream,
+                                             rmm::device_async_resource_ref mr)
+{
+  return make_empty_map_with_value(
+    cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}), stream, mr);
 }
 
 // Concatenating all input strings into one string, for which each input string is appended by a
@@ -422,6 +432,94 @@ rmm::device_uvector<int8_t> check_key_or_value_nodes(
   print_debug(key_or_value, "Nodes are key/value (1==key, 2==value)", ", ", stream);
 #endif
   return key_or_value;
+}
+
+// The tokenize + tree-classify prelude shared by both raw-map variants. Owns every buffer it
+// produces with the correct lifetimes: `preprocessed_input` is a span into the device memory held
+// by `concat_buff_wrapper`, so the wrapper must outlive the span -- the struct keeps both, and
+// both public functions keep the struct alive for the remainder of their bodies. The wrapper's
+// move preserves the underlying device allocation (no realloc), so the span stays valid across the
+// struct's move out of the helper.
+struct tokenized_input {
+  cudf::io::datasource::owning_buffer<rmm::device_buffer> concat_buff_wrapper;
+  cudf::device_span<char const> preprocessed_input;
+  rmm::device_uvector<PdaTokenT> tokens;
+  rmm::device_uvector<SymbolOffsetT> token_positions;
+  std::unique_ptr<cudf::column> should_be_nullified;
+  cudf::size_type num_nodes;
+  rmm::device_uvector<NodeIndexT> node_token_ids;
+  rmm::device_uvector<NodeIndexT> parent_node_ids;
+  rmm::device_uvector<int8_t> is_key_or_value_node;
+};
+
+// Run the shared prelude: concatenate + optionally normalize the input, tokenize it, then build
+// the node-to-token map, parent-node ids, and key/value classification. Both public functions call
+// this and diverge only after it returns.
+tokenized_input tokenize_and_classify(cudf::strings_column_view const& input,
+                                      json_parse_options const& options,
+                                      rmm::cuda_stream_view stream)
+{
+  auto [concat_json_buff, delimiter, should_be_nullified] = unify_json_strings(input, stream);
+  auto concat_buff_wrapper =
+    cudf::io::datasource::owning_buffer<rmm::device_buffer>(std::move(concat_json_buff));
+  if (options.normalize_single_quotes) {
+    cudf::io::json::detail::normalize_single_quotes(
+      concat_buff_wrapper, delimiter, stream, cudf::get_current_device_resource_ref());
+  }
+  auto const preprocessed_input = cudf::device_span<char const>(
+    reinterpret_cast<char const*>(concat_buff_wrapper.data()), concat_buff_wrapper.size());
+
+  // Tokenize the input json strings.
+  static_assert(sizeof(SymbolT) == sizeof(char),
+                "Invalid internal data for nested json tokenizer.");
+  auto [tokens, token_positions] = cudf::io::json::detail::get_token_stream(
+    preprocessed_input,
+    cudf::io::json_reader_options_builder{}
+      .lines(true)
+      .normalize_whitespace(false)  // don't need it
+      .experimental(true)
+      .mixed_types_as_string(true)
+      .recovery_mode(cudf::io::json_recovery_mode_t::RECOVER_WITH_NULL)
+      .strict_validation(true)
+      // specifying parameters
+      .delimiter(delimiter)
+      .numeric_leading_zeros(options.allow_leading_zeros)
+      .nonnumeric_numbers(options.allow_nonnumeric_numbers)
+      .unquoted_control_chars(options.allow_unquoted_control)
+      .build(),
+    stream,
+    cudf::get_current_device_resource_ref());
+
+#ifdef DEBUG_FROM_JSON
+  print_debug(tokens, "Tokens", ", ", stream);
+  print_debug(token_positions, "Token positions", ", ", stream);
+  std::cerr << "normalize_single_quotes: " << options.normalize_single_quotes << std::endl;
+  std::cerr << "allow_leading_zeros: " << options.allow_leading_zeros << std::endl;
+  std::cerr << "allow_nonnumeric_numbers: " << options.allow_nonnumeric_numbers << std::endl;
+  std::cerr << "allow_unquoted_control: " << options.allow_unquoted_control << std::endl;
+#endif
+
+  auto const num_nodes = static_cast<cudf::size_type>(
+    thrust::count_if(rmm::exec_policy_nosync(stream), tokens.begin(), tokens.end(), is_node{}));
+
+  // Compute the map from nodes to their indices in the list of all tokens.
+  auto node_token_ids = compute_node_to_token_index_map(num_nodes, tokens, stream);
+
+  // A map from each node to the index of its parent node.
+  auto parent_node_ids = compute_parent_node_ids(tokens, node_token_ids, stream);
+
+  // Check for each node if it is a map key or a map value to extract.
+  auto is_key_or_value_node = check_key_or_value_nodes(parent_node_ids, stream);
+
+  return tokenized_input{std::move(concat_buff_wrapper),
+                         preprocessed_input,
+                         std::move(tokens),
+                         std::move(token_positions),
+                         std::move(should_be_nullified),
+                         num_nodes,
+                         std::move(node_token_ids),
+                         std::move(parent_node_ids),
+                         std::move(is_key_or_value_node)};
 }
 
 // Convert token positions to node ranges for each valid node.
@@ -713,6 +811,7 @@ std::pair<rmm::device_buffer, cudf::size_type> create_null_mask(
   cudf::device_span<SymbolOffsetT const> token_positions,
   cudf::device_span<NodeIndexT const> node_token_ids,
   cudf::device_span<NodeIndexT const> parent_node_ids,
+  cudf::device_span<NodeIndexT const> precomputed_line_begin,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
@@ -739,30 +838,39 @@ std::pair<rmm::device_buffer, cudf::size_type> create_null_mask(
   // In addition to `should_be_nullified` which identified the null and empty rows,
   // we also need to identify the rows containing invalid JSON objects.
   if (num_invalid > 0) {
-    // Build a list of StructBegin tokens that start a line.
-    // We must have such list having size equal to the number of original input JSON strings.
-    rmm::device_uvector<NodeIndexT> line_begin_indices(num_nodes, stream);
-    auto const line_begin_copy_end = copy_if(node_id_it,
-                                             node_id_it + node_token_ids.size(),
-                                             line_begin_indices.begin(),
-                                             is_line_begin{tokens, node_token_ids, parent_node_ids},
-                                             stream);
-    auto const num_line_begin =
-      cuda::std::distance(line_begin_indices.begin(), line_begin_copy_end);
-    CUDF_EXPECTS(num_line_begin == num_rows, "Incorrect count of JSON objects.");
-#ifdef DEBUG_FROM_JSON
-    print_debug(line_begin_indices,
-                "Line begin StructBegin indices (size = " + std::to_string(num_line_begin) + ")",
-                ", ",
+    // The per-row line-begin StructBegin indices. A caller that already computed this identical
+    // list (same predicate, same node range) passes it in to skip the redundant device scan;
+    // otherwise compute it here.
+    rmm::device_uvector<NodeIndexT> computed_line_begin(0, stream);
+    NodeIndexT const* line_begin_indices = precomputed_line_begin.data();
+    if (precomputed_line_begin.empty()) {
+      // Build a list of StructBegin tokens that start a line.
+      // We must have such list having size equal to the number of original input JSON strings.
+      computed_line_begin.resize(num_nodes, stream);
+      auto const line_begin_copy_end =
+        copy_if(node_id_it,
+                node_id_it + node_token_ids.size(),
+                computed_line_begin.begin(),
+                is_line_begin{tokens, node_token_ids, parent_node_ids},
                 stream);
+      auto const num_line_begin =
+        cuda::std::distance(computed_line_begin.begin(), line_begin_copy_end);
+      CUDF_EXPECTS(num_line_begin == num_rows, "Incorrect count of JSON objects.");
+      line_begin_indices = computed_line_begin.data();
+#ifdef DEBUG_FROM_JSON
+      print_debug(computed_line_begin,
+                  "Line begin StructBegin indices (size = " + std::to_string(num_line_begin) + ")",
+                  ", ",
+                  stream);
 #endif
+    }
 
     // Scatter the indices of the invalid StructBegin nodes into `should_be_nullified`.
     thrust::for_each(rmm::exec_policy_nosync(stream),
                      invalid_indices.begin(),
                      invalid_indices.begin() + num_invalid,
                      [should_be_nullified = should_be_nullified->mutable_view().begin<bool>(),
-                      line_begin_indices  = line_begin_indices.begin(),
+                      line_begin_indices,
                       num_rows] __device__(auto node_idx) {
                        auto const row_idx = thrust::lower_bound(thrust::seq,
                                                                 line_begin_indices,
@@ -779,31 +887,32 @@ std::pair<rmm::device_buffer, cudf::size_type> create_null_mask(
   return {null_count > 0 ? std::move(null_mask) : rmm::device_buffer{0, stream, mr}, null_count};
 }
 
-// =====================================================================================
-// Array-value path: parse JSON `Map[String, Array[String]]` into
-// `List<Struct<String, List<String>>>`. All code below is NEW; it reuses the shared device
-// helpers above as-is and never modifies the existing `Map[String,String]` path.
-// =====================================================================================
+// Array-value path: parse `Map[String, Array[String]]` JSON into
+// `List<Struct<String, List<String>>>`, reusing the shared device helpers above.
 
 // Sentinel marking a node that is a direct element of a value array. Distinct from `key_sentinel`
 // (1) and `value_sentinel` (2) so the reused `extract_keys_or_values` can select elements.
 constexpr int8_t element_sentinel{3};
 
-// Build the empty/all-null output for an empty input: `List<Struct<String, List<String>>>` with
-// zero rows. Sibling of `make_empty_map`; the struct's value child is an empty `List<String>`
-// instead of an empty `STRING`.
+// True iff the byte range `[begin, end)` of `json` is exactly the 4-byte literal `null`. Callers
+// gate on a `ValueBegin` token first, so a JSON STRING "null" (a `StringBegin`) never reaches here;
+// the length-4 guard separates the literal from a 4-byte number like `1000`.
+__device__ inline bool is_json_null_literal(char const* json,
+                                            SymbolOffsetT begin,
+                                            SymbolOffsetT end)
+{
+  if (end - begin != 4) { return false; }
+  auto const* p = json + begin;
+  return p[0] == 'n' && p[1] == 'u' && p[2] == 'l' && p[3] == 'l';
+}
+
+// Zero-row `List<Struct<String, List<String>>>` for empty input. Sibling of `make_empty_map`;
+// the struct's value child is an empty `List<String>` instead of an empty `STRING`.
 std::unique_ptr<cudf::column> make_empty_map_array(rmm::cuda_stream_view stream,
                                                    rmm::device_async_resource_ref mr)
 {
-  auto keys   = cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
-  auto values = cudf::make_empty_lists_column(cudf::data_type{cudf::type_id::STRING});
-  std::vector<std::unique_ptr<cudf::column>> out_keys_vals;
-  out_keys_vals.emplace_back(std::move(keys));
-  out_keys_vals.emplace_back(std::move(values));
-  auto child =
-    cudf::make_structs_column(0, std::move(out_keys_vals), 0, rmm::device_buffer{}, stream, mr);
-  auto offsets = cudf::make_empty_column(cudf::data_type(cudf::type_id::INT32));
-  return cudf::make_lists_column(0, std::move(offsets), std::move(child), 0, rmm::device_buffer{});
+  return make_empty_map_with_value(
+    cudf::make_empty_lists_column(cudf::data_type{cudf::type_id::STRING}), stream, mr);
 }
 
 // Classify each node as a value-array element and, if so, compute its de-quoted byte range and
@@ -823,6 +932,44 @@ struct element_classify_fn {
   int8_t* element_flag;
   cuda::std::pair<SymbolOffsetT, SymbolOffsetT>* element_ranges;
   bool* element_valid;
+
+  // The end-of-* partner token for a given beginning-of-* token.
+  static __device__ token_t end_of_partner(PdaTokenT const tk)
+  {
+    switch (tk) {
+      case token_t::StructBegin: return token_t::StructEnd;
+      case token_t::ListBegin: return token_t::ListEnd;
+      case token_t::StringBegin: return token_t::StringEnd;
+      case token_t::ValueBegin: return token_t::ValueEnd;
+      case token_t::FieldNameBegin: return token_t::FieldNameEnd;
+      default: return token_t::ErrorBegin;
+    };
+  }
+
+  // Per-token nesting-depth delta (struct +/-1, list +/-256) so a running sum hits 0 at the node's
+  // matching close; the distinct magnitudes stop a struct close balancing a list open.
+  static __device__ int32_t nested_node_to_value(PdaTokenT const tk)
+  {
+    switch (tk) {
+      case token_t::StructBegin: return 1;
+      case token_t::StructEnd: return -1;
+      case token_t::ListBegin: return 1 << 8;
+      case token_t::ListEnd: return -(1 << 8);
+      default: return 0;
+    };
+  }
+
+  // Strip the opening/closing quote for string elements; leave literals/values verbatim.
+  static __device__ SymbolOffsetT get_token_position(PdaTokenT const tk, SymbolOffsetT const pos)
+  {
+    constexpr SymbolOffsetT quote_char_size = 1;
+    switch (tk) {
+      case token_t::StringBegin: return pos + quote_char_size;
+      case token_t::StringEnd: return pos;
+      case token_t::FieldNameBegin: return pos + quote_char_size;
+      default: return pos;
+    };
+  }
 
   __device__ void operator()(cudf::size_type node_id) const
   {
@@ -844,50 +991,13 @@ struct element_classify_fn {
       return;
     }
 
-    // The end-of-* partner token for a given beginning-of-* token.
-    auto const end_of_partner =
-      cuda::proclaim_return_type<token_t>([] __device__(PdaTokenT const tk) {
-        switch (tk) {
-          case token_t::StructBegin: return token_t::StructEnd;
-          case token_t::ListBegin: return token_t::ListEnd;
-          case token_t::StringBegin: return token_t::StringEnd;
-          case token_t::ValueBegin: return token_t::ValueEnd;
-          case token_t::FieldNameBegin: return token_t::FieldNameEnd;
-          default: return token_t::ErrorBegin;
-        };
-      });
-
-    // Encode a fixed value for nested node types (list+struct), used to find the matching close.
-    auto const nested_node_to_value =
-      cuda::proclaim_return_type<int32_t>([] __device__(PdaTokenT const tk) -> int32_t {
-        switch (tk) {
-          case token_t::StructBegin: return 1;
-          case token_t::StructEnd: return -1;
-          case token_t::ListBegin: return 1 << 8;
-          case token_t::ListEnd: return -(1 << 8);
-          default: return 0;
-        };
-      });
-
-    // Strip the opening/closing quote for string elements; leave literals/values verbatim.
-    auto const get_token_position = cuda::proclaim_return_type<SymbolOffsetT>(
-      [] __device__(PdaTokenT const tk, SymbolOffsetT const pos) {
-        constexpr SymbolOffsetT quote_char_size = 1;
-        switch (tk) {
-          case token_t::StringBegin: return pos + quote_char_size;
-          case token_t::StringEnd: return pos;
-          case token_t::FieldNameBegin: return pos + quote_char_size;
-          default: return pos;
-        };
-      });
-
     auto const range_begin = get_token_position(token, token_positions[token_idx]);
     auto range_end         = range_begin + 1;
     if ((token_idx + 1) < tokens.size() && end_of_partner(token) == tokens[token_idx + 1]) {
       range_end = get_token_position(tokens[token_idx + 1], token_positions[token_idx + 1]);
     } else {
-      // Out-of-scope nested element (`[`/`{`): take the whole raw span via the close-matching
-      // accumulator, identical to the existing `node_ranges_fn` nested path.
+      // Nested element (`[`/`{`): its end token isn't adjacent, so span to the matching close
+      // using the nesting-depth delta.
       auto nested_range_value = nested_node_to_value(token);
       auto end_idx            = token_idx + 1;
       while (end_idx < tokens.size()) {
@@ -899,23 +1009,19 @@ struct element_classify_fn {
         ++end_idx;
       }
       cudf_assert(nested_range_value == 0 && "Invalid element range computation.");
+      cudf_assert((end_idx + 1 < tokens.size()) && "Invalid element range computation.");
     }
 
     element_flag[node_id]   = element_sentinel;
     element_ranges[node_id] = {range_begin, range_end};
 
-    // Mask #2: a literal `null` element is a null element. The length-4 guard distinguishes it from
-    // a 4-byte number (e.g. `1000`); a JSON STRING "null" is a StringBegin (not ValueBegin), so it
-    // stays valid. The byte compare is the only signal — the token stream carries no null literal.
-    // A null element also gets an empty byte span: it is materialized as a null string, and a
-    // non-empty span under a null entry is a non-empty null (rejected by cudf; the manual list
-    // assembly relies on the element child having no non-empty nulls).
-    if (token == token_t::ValueBegin && (range_end - range_begin) == 4) {
-      auto const* p = input_json.data() + range_begin;
-      if (p[0] == 'n' && p[1] == 'u' && p[2] == 'l' && p[3] == 'l') {
-        element_valid[node_id]  = false;
-        element_ranges[node_id] = {range_begin, range_begin};
-      }
+    // Mask #2: a literal `null` element is a null element, and gets an empty byte span -- it
+    // materializes as a null string with no non-empty-null payload, which the manual list assembly
+    // requires.
+    if (token == token_t::ValueBegin &&
+        is_json_null_literal(input_json.data(), range_begin, range_end)) {
+      element_valid[node_id]  = false;
+      element_ranges[node_id] = {range_begin, range_begin};
     }
   }
 };
@@ -923,69 +1029,25 @@ struct element_classify_fn {
 }  // namespace
 
 std::unique_ptr<cudf::column> from_json_to_raw_map(cudf::strings_column_view const& input,
-                                                   bool normalize_single_quotes,
-                                                   bool allow_leading_zeros,
-                                                   bool allow_nonnumeric_numbers,
-                                                   bool allow_unquoted_control,
+                                                   json_parse_options options,
                                                    rmm::cuda_stream_view stream,
                                                    rmm::device_async_resource_ref mr)
 {
+  SRJ_FUNC_RANGE();
   if (input.is_empty()) { return make_empty_map(stream, mr); }
 
-  // Firstly, concatenate all the input json strings into one buffer.
-  // When testing/debugging, the output can be validated using
+  // Concatenate, optionally normalize, tokenize, and classify the input json strings. The returned
+  // struct owns the concatenated buffer that `preprocessed_input` points into, so it must stay
+  // alive for the rest of this function. When testing/debugging, the output can be validated using
   // https://jsonformatter.curiousconcept.com.
-  auto [concat_json_buff, delimiter, should_be_nullified] = unify_json_strings(input, stream);
-  auto concat_buff_wrapper =
-    cudf::io::datasource::owning_buffer<rmm::device_buffer>(std::move(concat_json_buff));
-  if (normalize_single_quotes) {
-    cudf::io::json::detail::normalize_single_quotes(
-      concat_buff_wrapper, delimiter, stream, cudf::get_current_device_resource_ref());
-  }
-  auto const preprocessed_input = cudf::device_span<char const>(
-    reinterpret_cast<char const*>(concat_buff_wrapper.data()), concat_buff_wrapper.size());
-
-  // Tokenize the input json strings.
-  static_assert(sizeof(SymbolT) == sizeof(char),
-                "Invalid internal data for nested json tokenizer.");
-  auto const [tokens, token_positions] = cudf::io::json::detail::get_token_stream(
-    preprocessed_input,
-    cudf::io::json_reader_options_builder{}
-      .lines(true)
-      .normalize_whitespace(false)  // don't need it
-      .experimental(true)
-      .mixed_types_as_string(true)
-      .recovery_mode(cudf::io::json_recovery_mode_t::RECOVER_WITH_NULL)
-      .strict_validation(true)
-      // specifying parameters
-      .delimiter(delimiter)
-      .numeric_leading_zeros(allow_leading_zeros)
-      .nonnumeric_numbers(allow_nonnumeric_numbers)
-      .unquoted_control_chars(allow_unquoted_control)
-      .build(),
-    stream,
-    cudf::get_current_device_resource_ref());
-
-#ifdef DEBUG_FROM_JSON
-  print_debug(tokens, "Tokens", ", ", stream);
-  print_debug(token_positions, "Token positions", ", ", stream);
-  std::cerr << "normalize_single_quotes: " << normalize_single_quotes << std::endl;
-  std::cerr << "allow_leading_zeros: " << allow_leading_zeros << std::endl;
-  std::cerr << "allow_nonnumeric_numbers: " << allow_nonnumeric_numbers << std::endl;
-  std::cerr << "allow_unquoted_control: " << allow_unquoted_control << std::endl;
-#endif
-
-  auto const num_nodes =
-    thrust::count_if(rmm::exec_policy_nosync(stream), tokens.begin(), tokens.end(), is_node{});
-
-  // Compute the map from nodes to their indices in the list of all tokens.
-  auto const node_token_ids = compute_node_to_token_index_map(num_nodes, tokens, stream);
-
-  // A map from each node to the index of its parent node.
-  auto const parent_node_ids = compute_parent_node_ids(tokens, node_token_ids, stream);
-
-  // Check for each node if it is a map key or a map value to extract.
-  auto const is_key_or_value_node = check_key_or_value_nodes(parent_node_ids, stream);
+  auto const tok                   = tokenize_and_classify(input, options, stream);
+  auto const& preprocessed_input   = tok.preprocessed_input;
+  auto const& tokens               = tok.tokens;
+  auto const& token_positions      = tok.token_positions;
+  auto const& should_be_nullified  = tok.should_be_nullified;
+  auto const& node_token_ids       = tok.node_token_ids;
+  auto const& parent_node_ids      = tok.parent_node_ids;
+  auto const& is_key_or_value_node = tok.is_key_or_value_node;
 
   // Compute index range for each node.
   // These ranges identify positions to extract nodes from the unified json string.
@@ -1026,6 +1088,7 @@ std::unique_ptr<cudf::column> from_json_to_raw_map(cudf::strings_column_view con
                                                   token_positions,
                                                   node_token_ids,
                                                   parent_node_ids,
+                                                  /*precomputed_line_begin*/ {},
                                                   stream,
                                                   mr);
 
@@ -1039,55 +1102,28 @@ std::unique_ptr<cudf::column> from_json_to_raw_map(cudf::strings_column_view con
 
 std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
   cudf::strings_column_view const& input,
-  bool normalize_single_quotes,
-  bool allow_leading_zeros,
-  bool allow_nonnumeric_numbers,
-  bool allow_unquoted_control,
+  json_parse_options options,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
   SRJ_FUNC_RANGE();
   if (input.is_empty()) { return make_empty_map_array(stream, mr); }
 
-  // Shared prelude, reused verbatim from `from_json_to_raw_map`.
-  auto [concat_json_buff, delimiter, should_be_nullified] = unify_json_strings(input, stream);
-  auto concat_buff_wrapper =
-    cudf::io::datasource::owning_buffer<rmm::device_buffer>(std::move(concat_json_buff));
-  if (normalize_single_quotes) {
-    cudf::io::json::detail::normalize_single_quotes(
-      concat_buff_wrapper, delimiter, stream, cudf::get_current_device_resource_ref());
-  }
-  auto const preprocessed_input = cudf::device_span<char const>(
-    reinterpret_cast<char const*>(concat_buff_wrapper.data()), concat_buff_wrapper.size());
+  // Concatenate, optionally normalize, tokenize, and classify the input JSON (same shared prelude
+  // as the string-map path). The returned struct owns the concatenated buffer that
+  // `preprocessed_input` points into, so it must stay alive for the rest of this function.
+  auto const tok                   = tokenize_and_classify(input, options, stream);
+  auto const& preprocessed_input   = tok.preprocessed_input;
+  auto const& tokens               = tok.tokens;
+  auto const& token_positions      = tok.token_positions;
+  auto const& should_be_nullified  = tok.should_be_nullified;
+  auto const num_nodes             = tok.num_nodes;
+  auto const& node_token_ids       = tok.node_token_ids;
+  auto const& parent_node_ids      = tok.parent_node_ids;
+  auto const& is_key_or_value_node = tok.is_key_or_value_node;
 
-  static_assert(sizeof(SymbolT) == sizeof(char),
-                "Invalid internal data for nested json tokenizer.");
-  auto const [tokens, token_positions] = cudf::io::json::detail::get_token_stream(
-    preprocessed_input,
-    cudf::io::json_reader_options_builder{}
-      .lines(true)
-      .normalize_whitespace(false)
-      .experimental(true)
-      .mixed_types_as_string(true)
-      .recovery_mode(cudf::io::json_recovery_mode_t::RECOVER_WITH_NULL)
-      .strict_validation(true)
-      .delimiter(delimiter)
-      .numeric_leading_zeros(allow_leading_zeros)
-      .nonnumeric_numbers(allow_nonnumeric_numbers)
-      .unquoted_control_chars(allow_unquoted_control)
-      .build(),
-    stream,
-    cudf::get_current_device_resource_ref());
-
-  auto const num_nodes =
-    thrust::count_if(rmm::exec_policy_nosync(stream), tokens.begin(), tokens.end(), is_node{});
-
-  auto const node_token_ids       = compute_node_to_token_index_map(num_nodes, tokens, stream);
-  auto const parent_node_ids      = compute_parent_node_ids(tokens, node_token_ids, stream);
-  auto const is_key_or_value_node = check_key_or_value_nodes(parent_node_ids, stream);
-
-  // Key ranges reuse the existing node-range computation; element ranges are computed by the new
-  // fused classifier below. Keys are extracted exactly as in the string path.
+  // Keys use the shared node-range computation; element ranges come from the fused classifier
+  // below.
   auto const node_ranges = compute_node_ranges(
     tokens, token_positions, node_token_ids, parent_node_ids, is_key_or_value_node, stream);
   auto extracted_keys = extract_keys_or_values(
@@ -1115,7 +1151,7 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
                                          element_valid.begin()});
   }
 
-  // Extract element strings via the reused extractor (0-null STRING column), then attach mask #2.
+  // Extract element strings with the shared extractor (a 0-null STRING column); attach mask #2.
   auto extracted_elements = extract_keys_or_values(
     element_sentinel, element_ranges, element_flag, preprocessed_input, stream, mr);
   {
@@ -1145,20 +1181,25 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
     }
   }
 
-  // Outer offsets: keys per row (unchanged shape) reuses the string-path computation.
+  // Outer list offsets: one slot per input row (shared list-offset computation).
   auto outer_offsets =
     compute_list_offsets(input.size(), parent_node_ids, is_key_or_value_node, stream, mr);
 
-  // The struct/inner-list row count is the number of value nodes (one per map pair), which equals
-  // the key count in a well-formed map skeleton (mirrors the existing keys==values guard).
-  auto const num_values = static_cast<cudf::size_type>(
+  // Struct/inner-list row count = number of value nodes (one per map pair). In a well-formed map
+  // this equals the key count, which is already known on the host for free (column::size() is a
+  // noexcept O(1) accessor). The device value-node count is computed only as a debug-build check of
+  // that parser invariant, since the equality is the only consumer of the reduction.
+  auto const num_values = extracted_keys->size();
+#ifndef NDEBUG
+  auto const num_value_nodes = static_cast<cudf::size_type>(
     thrust::count_if(rmm::exec_policy_nosync(stream),
                      is_key_or_value_node.begin(),
                      is_key_or_value_node.end(),
                      cuda::proclaim_return_type<bool>(
                        [] __device__(int8_t const kv) { return kv == value_sentinel; })));
-  CUDF_EXPECTS(num_values == extracted_keys->size(),
+  CUDF_EXPECTS(num_value_nodes == num_values,
                "Invalid key-value pair extraction for map of arrays.");
+#endif
 
   // Value-node ordinal map: exclusive scan of the value-tagged flag over nodes. A value node's
   // ordinal is its position among value nodes in document order, which matches the key/value
@@ -1224,9 +1265,9 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
                      });
   }
 
-  // Assemble the inner `List<String>` (the struct's value child) with manual column construction,
-  // mirroring the string path: the public factory would launch a `purge_nonempty_nulls` scan, but
-  // the inner list carries nulls by design (mask #1) and the element child has no non-empty nulls.
+  // Assemble the inner `List<String>` (the struct's value child) by hand: the public factory would
+  // launch a `purge_nonempty_nulls` scan, but the inner list carries nulls by design (mask #1) and
+  // its element child has no non-empty nulls.
   auto [inner_mask, inner_null_count] = cudf::detail::valid_if(
     inner_valid.begin(), inner_valid.end(), cuda::std::identity{}, stream, mr);
   auto inner_offsets_col =
@@ -1249,28 +1290,16 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
   auto structs_col = cudf::make_structs_column(
     num_values, std::move(out_keys_vals), 0, rmm::device_buffer{}, stream, mr);
 
-  // Outer list assembly, mirroring the string path's manual construction.
+  // Assemble the outer list (row offsets + struct child).
   std::vector<std::unique_ptr<cudf::column>> list_children;
   list_children.emplace_back(std::move(outer_offsets));
   list_children.emplace_back(std::move(structs_col));
 
-  // Row-level bad-record semantics (Spark `from_json`): if ANY value node in a row is a HARD TYPE
-  // MISMATCH the whole row is nullified. A hard mismatch is a value node whose token is neither
-  // `ListBegin` (a valid array) nor the JSON `null` literal (a kept row with a null inner list).
-  // We fold this into `should_be_nullified` BEFORE `create_null_mask` so the existing row null-mask
-  // computation (which already incorporates null/empty/invalid-JSON rows) absorbs it with the
-  // correct `null_count`. The JSON-null literal check mirrors the element-level mask #2 predicate
-  // in `element_classify_fn` (a `ValueBegin` whose de-quoted byte range is exactly the 4 bytes
-  // `null`); here the value node's `node_ranges` entry carries the same de-quoted range. Node->row
-  // is found by binary-searching the sorted line-begin `StructBegin` node ids (one per row),
-  // mirroring `create_null_mask`: a value node is a strict descendant of the last line-begin id not
-  // exceeding it.
+  // Line-begin StructBegin node ids, one per input row, sorted by construction. Computed once here
+  // and reused by `create_null_mask` below (passed in to skip its identical recomputation).
+  rmm::device_uvector<NodeIndexT> line_begin_indices(num_nodes, stream);
   {
-    auto const node_id_it = thrust::counting_iterator<NodeIndexT>(0);
-
-    // Sorted list of line-begin StructBegin node ids (one per input row), mirroring
-    // `create_null_mask`. A value node's row is the last line-begin id not exceeding it.
-    rmm::device_uvector<NodeIndexT> line_begin_indices(num_nodes, stream);
+    auto const node_id_it          = thrust::counting_iterator<NodeIndexT>(0);
     auto const line_begin_copy_end = copy_if(node_id_it,
                                              node_id_it + num_nodes,
                                              line_begin_indices.begin(),
@@ -1279,7 +1308,15 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
     auto const num_line_begin =
       cuda::std::distance(line_begin_indices.begin(), line_begin_copy_end);
     CUDF_EXPECTS(num_line_begin == input.size(), "Incorrect count of JSON objects.");
+  }
 
+  // Row-level bad-record semantics (Spark `from_json`): a row is nullified if any of its value
+  // nodes is a hard type mismatch -- a value that is neither a `ListBegin` (valid array) nor the
+  // JSON `null` literal (kept, with a null inner list). Folding this into `should_be_nullified`
+  // before `create_null_mask` lets the shared row null-mask computation absorb it with the correct
+  // `null_count`. A value node's row is the last line-begin `StructBegin` id not exceeding it.
+  {
+    auto const node_id_it = thrust::counting_iterator<NodeIndexT>(0);
     thrust::for_each(
       rmm::exec_policy_nosync(stream),
       node_id_it,
@@ -1296,15 +1333,12 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
         if (key_or_value[node_id] != value_sentinel) { return; }
         auto const token = tokens[node_token_ids[node_id]];
         if (token == token_t::ListBegin) { return; }  // valid array.
-        // Keep the row for a JSON `null` literal value: a `ValueBegin` whose de-quoted byte range
-        // is exactly the 4 bytes `null` (a JSON STRING "null" is a `StringBegin`, so it does not
-        // match and is treated as a hard mismatch, matching Spark).
+        // Keep the row for a JSON `null` literal value (its inner list becomes null). A JSON STRING
+        // "null" is a `StringBegin`, not a `ValueBegin`, so it is a hard mismatch like any other
+        // scalar, matching Spark.
         if (token == token_t::ValueBegin) {
           auto const range = node_ranges[node_id];
-          if ((range.second - range.first) == 4) {
-            auto const* p = input_json + range.first;
-            if (p[0] == 'n' && p[1] == 'u' && p[2] == 'l' && p[3] == 'l') { return; }
-          }
+          if (is_json_null_literal(input_json, range.first, range.second)) { return; }
         }
         // Hard type mismatch (scalar string/number/bool, object, or any non-array, non-null value):
         // nullify the entire row. Row = last line-begin id not exceeding `node_id`.
@@ -1322,6 +1356,7 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
                                                   token_positions,
                                                   node_token_ids,
                                                   parent_node_ids,
+                                                  line_begin_indices,
                                                   stream,
                                                   mr);
 

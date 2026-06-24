@@ -1,0 +1,103 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.nvidia.spark.rapids.jni;
+
+import ai.rapids.cudf.ColumnVector;
+import ai.rapids.cudf.DType;
+import ai.rapids.cudf.HostColumnVector;
+import ai.rapids.cudf.JSONOptions;
+
+import org.junit.jupiter.api.Test;
+
+import java.util.Arrays;
+import java.util.List;
+
+import static ai.rapids.cudf.AssertUtils.assertColumnsAreEqual;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+/**
+ * Tests for the array-valued surface of {@link JSONUtils#extractRawMapFromJsonString}:
+ *  - the three-argument overload with {@link JSONUtils.MapValueType#ARRAY_OF_STRING}, which produces
+ *    a {@code LIST<STRUCT<STRING, LIST<STRING>>>} column;
+ *  - the three-argument overload with {@link JSONUtils.MapValueType#STRING}, which must agree with
+ *    the deprecated two-argument overload it delegates to;
+ *  - the unmapped-{@code valueType} guard of the dispatch switch.
+ */
+public class FromJsonToRawMapArrayTest {
+  // Column schema for the array-valued result: LIST<STRUCT<key:STRING, value:LIST<STRING>>>.
+  private static final HostColumnVector.StructType STRUCT_TYPE =
+      new HostColumnVector.StructType(true,
+          new HostColumnVector.BasicType(true, DType.STRING),                              // key
+          new HostColumnVector.ListType(true, new HostColumnVector.BasicType(true,
+              DType.STRING)));                                                             // value
+  private static final HostColumnVector.ListType LIST_TYPE =
+      new HostColumnVector.ListType(true, STRUCT_TYPE);
+
+  // Same leniency flags as FromJsonToRawMapTest so both suites parse identically.
+  private static JSONOptions getOptions() {
+    return JSONOptions.builder()
+        .withNormalizeSingleQuotes(true)
+        .withLeadingZeros(true)
+        .withNonNumericNumbers(true)
+        .withUnquotedControlChars(true)
+        .build();
+  }
+
+  private static HostColumnVector.StructData pair(String key, List<String> values) {
+    return new HostColumnVector.StructData(key, values);
+  }
+
+  // ARRAY_OF_STRING: a single object whose one key maps to a two-element string array. The engine
+  // copies the elements verbatim with their surrounding quotes stripped, so {"k":["a","b"]} yields
+  // one non-null row holding the pair (k -> ["a", "b"]).
+  @Test
+  void testExtractRawMapArrayFromJsonString() {
+    List<HostColumnVector.StructData> row0 =
+        Arrays.asList(pair("k", Arrays.asList("a", "b")));
+    try (ColumnVector input = ColumnVector.fromStrings("{\"k\":[\"a\",\"b\"]}");
+         ColumnVector result = JSONUtils.extractRawMapFromJsonString(input, getOptions(),
+             JSONUtils.MapValueType.ARRAY_OF_STRING);
+         ColumnVector expected = ColumnVector.fromLists(LIST_TYPE, row0)) {
+      assertColumnsAreEqual(expected, result);
+    }
+  }
+
+  // The three-argument overload with MapValueType.STRING must produce exactly what the deprecated
+  // two-argument overload produces, since the latter delegates to the former with STRING.
+  @Test
+  void testExtractRawMapStringMatchesDeprecatedOverload() {
+    try (ColumnVector input = ColumnVector.fromStrings("{\"k\":\"v\"}");
+         ColumnVector deprecated = JSONUtils.extractRawMapFromJsonString(input, getOptions());
+         ColumnVector typed = JSONUtils.extractRawMapFromJsonString(input, getOptions(),
+             JSONUtils.MapValueType.STRING)) {
+      assertColumnsAreEqual(deprecated, typed);
+    }
+  }
+
+  // The dispatch switch rejects a value it cannot map. The MapValueType enum only declares STRING
+  // and ARRAY_OF_STRING, so the IllegalArgumentException default arm is unreachable through the
+  // public type; the closest reachable rejection is a null valueType, which the switch refuses with
+  // a NullPointerException before reaching any arm. This pins that an unmapped value is never
+  // silently accepted.
+  @Test
+  void testExtractRawMapNullValueTypeRejected() {
+    try (ColumnVector input = ColumnVector.fromStrings("{\"k\":\"v\"}")) {
+      assertThrows(NullPointerException.class,
+          () -> JSONUtils.extractRawMapFromJsonString(input, getOptions(), null));
+    }
+  }
+}

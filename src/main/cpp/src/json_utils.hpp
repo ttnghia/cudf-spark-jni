@@ -28,14 +28,21 @@
 namespace spark_rapids_jni {
 
 /**
+ * @brief Leniency options for the raw-map JSON extraction functions
+ */
+struct json_parse_options {
+  bool normalize_single_quotes  = false;
+  bool allow_leading_zeros      = false;
+  bool allow_nonnumeric_numbers = false;
+  bool allow_unquoted_control   = false;
+};
+
+/**
  * @brief Extract a map column from the JSON strings given by an input strings column.
  */
 std::unique_ptr<cudf::column> from_json_to_raw_map(
   cudf::strings_column_view const& input,
-  bool normalize_single_quotes,
-  bool allow_leading_zeros,
-  bool allow_nonnumeric_numbers,
-  bool allow_unquoted_control,
+  json_parse_options options,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
@@ -55,10 +62,7 @@ std::unique_ptr<cudf::column> from_json_to_raw_map(
  */
 std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
   cudf::strings_column_view const& input,
-  bool normalize_single_quotes,
-  bool allow_leading_zeros,
-  bool allow_nonnumeric_numbers,
-  bool allow_unquoted_control,
+  json_parse_options options,
   rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 

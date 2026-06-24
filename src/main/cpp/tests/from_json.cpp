@@ -13,20 +13,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+#include "json_utils.hpp"
+
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_wrapper.hpp>
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/structs/structs_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
 
 #include <rmm/device_buffer.hpp>
-
-#include <json_utils.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -108,24 +110,20 @@ std::unique_ptr<cudf::column> make_expected_raw_map(std::vector<std::vector<kv>>
 // Convenience: every row valid.
 std::vector<bool> all_valid(std::size_t n) { return std::vector<bool>(n, true); }
 
+// Default leniency options shared by all calls (built once from the flags above).
+constexpr spark_rapids_jni::json_parse_options default_options{
+  normalize_single_quotes, allow_leading_zeros, allow_nonnumeric_numbers, allow_unquoted_control};
+
 // Thin wrapper to invoke the `Map[String,String]` engine-under-test with the shared default flags.
 std::unique_ptr<cudf::column> raw_map(cudf::strings_column_view const& input)
 {
-  return spark_rapids_jni::from_json_to_raw_map(input,
-                                                normalize_single_quotes,
-                                                allow_leading_zeros,
-                                                allow_nonnumeric_numbers,
-                                                allow_unquoted_control);
+  return spark_rapids_jni::from_json_to_raw_map(input, default_options);
 }
 
 // Thin wrapper to invoke the `Map[String,Array[String]]` engine-under-test with the shared flags.
 std::unique_ptr<cudf::column> raw_map_array(cudf::strings_column_view const& input)
 {
-  return spark_rapids_jni::from_json_to_raw_map_array_values(input,
-                                                             normalize_single_quotes,
-                                                             allow_leading_zeros,
-                                                             allow_nonnumeric_numbers,
-                                                             allow_unquoted_control);
+  return spark_rapids_jni::from_json_to_raw_map_array_values(input, default_options);
 }
 
 }  // namespace
@@ -271,7 +269,8 @@ TEST_F(FromJsonTest, RawMapOpt_EmptyObjectRow)
 }
 
 // ---------------------------------------------------------------------------
-// Characterization tests for edge cases: assert structural invariants rather than exact output.
+// Edge-case tests: each pins the exact output. The shape helper below is retained for the large
+// stress test, where building a 50k-row expected column would dominate the test.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -299,68 +298,62 @@ bool expect_raw_map_shape(cudf::column_view const& col, cudf::size_type num_rows
 
 }  // namespace
 
-// JSON `null` literal value `{"k":null}` -- the map path keeps the literal text "null"; assert
-// shape + that surrounding valid rows contribute their pairs.
+// JSON `null` literal value `{"k":null}` -- the map path keeps the literal text "null" as the value
+// (no JSON-null handling: the value node range is copied verbatim). The whole row stays valid.
 TEST_F(FromJsonTest, RawMapOpt_Char_NullLiteralValue)
 {
   auto const input_col =
     cudf::test::strings_column_wrapper{R"({"a":"x"})", R"({"k":null})", R"({"b":"y"})"};
-  auto const input  = cudf::strings_column_view{input_col};
-  auto const result = raw_map(input);
+  auto const input = cudf::strings_column_view{input_col};
 
-  if (expect_raw_map_shape(result->view(), 3)) {
-    auto const lcv = cudf::lists_column_view{result->view()};
-    EXPECT_GE(lcv.child().size(), 2);
-  }
+  auto const expected =
+    make_expected_raw_map({{{"a", "x"}}, {{"k", "null"}}, {{"b", "y"}}}, all_valid(3));
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*raw_map(input), *expected);
 }
 
-// Escaped quote `\"` and escaped backslash `\\` inside a quoted string value survive literally.
+// Escaped quote `\"` and escaped backslash `\\` inside a quoted string value survive literally
+// (the extractor copies the value's byte range verbatim; it performs no JSON unescaping).
 TEST_F(FromJsonTest, RawMapOpt_Char_EscapedValues)
 {
   auto const input_col = cudf::test::strings_column_wrapper{R"({"d":"x\"y","e":"p\\q"})"};
   auto const input     = cudf::strings_column_view{input_col};
-  auto const result    = raw_map(input);
 
-  if (expect_raw_map_shape(result->view(), 1)) {
-    auto const lcv = cudf::lists_column_view{result->view()};
-    EXPECT_EQ(result->view().null_count(), 0);
-    EXPECT_GE(lcv.child().size(), 2);
-  }
+  auto const expected = make_expected_raw_map({{{"d", R"(x\"y)"}, {"e", R"(p\\q)"}}}, all_valid(1));
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*raw_map(input), *expected);
 }
 
-// Malformed / invalid rows mixed with valid rows -> invalid rows nullified.
+// Malformed / invalid rows mixed with valid rows -> invalid rows become NULL list rows; the valid
+// rows contribute their pairs unchanged. The null rows' pairs are ignored (passed as `{}`).
 TEST_F(FromJsonTest, RawMapOpt_Char_MalformedRows)
 {
   auto const input_col = cudf::test::strings_column_wrapper{
     R"({"a":"1"})", R"(not json at all)", R"({"b":"2"})", R"(@@@)"};
-  auto const input  = cudf::strings_column_view{input_col};
-  auto const result = raw_map(input);
+  auto const input = cudf::strings_column_view{input_col};
 
-  if (expect_raw_map_shape(result->view(), 4)) { EXPECT_GE(result->view().null_count(), 2); }
+  auto const expected =
+    make_expected_raw_map({{{"a", "1"}}, {}, {{"b", "2"}}, {}}, {true, false, true, false});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*raw_map(input), *expected);
 }
 
-// Duplicate keys `{"a":"1","a":"2"}` emit one pair per occurrence.
+// Duplicate keys `{"a":"1","a":"2"}` emit one pair per occurrence in textual order (no collapsing).
 TEST_F(FromJsonTest, RawMapOpt_Char_DuplicateKeys)
 {
   auto const input_col = cudf::test::strings_column_wrapper{R"({"a":"1","a":"2"})"};
   auto const input     = cudf::strings_column_view{input_col};
-  auto const result    = raw_map(input);
 
-  if (expect_raw_map_shape(result->view(), 1)) {
-    auto const lcv = cudf::lists_column_view{result->view()};
-    EXPECT_EQ(result->view().null_count(), 0);
-    EXPECT_GE(lcv.child().size(), 1);
-  }
+  auto const expected = make_expected_raw_map({{{"a", "1"}, {"a", "2"}}}, all_valid(1));
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*raw_map(input), *expected);
 }
 
-// Whitespace-only row between valid rows -> nullified.
+// Whitespace-only row between valid rows -> NULL list row; the surrounding rows are unaffected.
 TEST_F(FromJsonTest, RawMapOpt_Char_WhitespaceOnlyRow)
 {
   auto const input_col = cudf::test::strings_column_wrapper{R"({"a":"1"})", "   ", R"({"b":"2"})"};
   auto const input     = cudf::strings_column_view{input_col};
-  auto const result    = raw_map(input);
 
-  if (expect_raw_map_shape(result->view(), 3)) { EXPECT_GE(result->view().null_count(), 1); }
+  auto const expected =
+    make_expected_raw_map({{{"a", "1"}}, {}, {{"b", "2"}}}, {true, false, true});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*raw_map(input), *expected);
 }
 
 // Stress: 50k rows x 32 keys with interspersed NULL-input and malformed rows. Asserts the
@@ -415,6 +408,72 @@ TEST_F(FromJsonTest, RawMapOpt_StressInvariantsWithBadRows)
   ASSERT_TRUE(expect_raw_map_shape(result->view(), num_rows));
   EXPECT_EQ(result->view().null_count(),
             static_cast<cudf::size_type>(null_rows.size() + bad_rows.size()));
+}
+
+// Empty input for the map function exercises the `make_empty_map` zero-row fast path.
+TEST_F(FromJsonTest, RawMapOpt_EmptyInput)
+{
+  auto const input_col = cudf::test::strings_column_wrapper{};
+  auto const input     = cudf::strings_column_view{input_col};
+
+  auto const result = raw_map(input);
+  EXPECT_EQ(result->size(), 0);
+  EXPECT_EQ(result->type().id(), cudf::type_id::LIST);
+
+  auto const lcv          = cudf::lists_column_view{result->view()};
+  auto const structs_view = lcv.child();
+  EXPECT_EQ(structs_view.type().id(), cudf::type_id::STRUCT);
+  ASSERT_EQ(structs_view.num_children(), 2);
+  auto const scv = cudf::structs_column_view{structs_view};
+  EXPECT_EQ(scv.child(0).type().id(), cudf::type_id::STRING);  // keys.
+  EXPECT_EQ(scv.child(1).type().id(), cudf::type_id::STRING);  // string value.
+}
+
+// allow_unquoted_control=true: a literal control char (tab) inside a quoted value is accepted and
+// copied verbatim into the value bytes.
+TEST_F(FromJsonTest, RawMapOpt_UnquotedControl)
+{
+  auto const input_col = cudf::test::strings_column_wrapper{"{\"k\":\"a\tb\"}"};
+  auto const input     = cudf::strings_column_view{input_col};
+
+  auto const result = spark_rapids_jni::from_json_to_raw_map(
+    input,
+    spark_rapids_jni::json_parse_options{normalize_single_quotes,
+                                         allow_leading_zeros,
+                                         allow_nonnumeric_numbers,
+                                         /*allow_unquoted_control=*/true});
+
+  auto const expected = make_expected_raw_map({{{"k", "a\tb"}}}, all_valid(1));
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, *expected);
+}
+
+// Sliced (nonzero-offset) input: slice off row 0 of a 3-row column and verify the 2-row result.
+TEST_F(FromJsonTest, RawMapOpt_SlicedInput)
+{
+  auto const input_col =
+    cudf::test::strings_column_wrapper{R"({"skip":"me"})", R"({"k":"a"})", R"({"k":"b"})"};
+  auto const sliced = cudf::slice(input_col, {1, 3})[0];
+  auto const input  = cudf::strings_column_view{sliced};
+
+  auto const expected = make_expected_raw_map({{{"k", "a"}}, {{"k", "b"}}}, all_valid(2));
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*raw_map(input), *expected);
+}
+
+// Null-mask write path around warp word boundaries (< 32, == 32, > 32, > 64 rows). The first and
+// last rows are null in each size so the boundary word is exercised.
+TEST_F(FromJsonTest, RawMapOpt_WarpBoundaryNullMask)
+{
+  for (int const num_rows : {31, 32, 33, 65}) {
+    std::vector<std::string> rows(static_cast<std::size_t>(num_rows), R"({"k":"v"})");
+    std::vector<bool> validity(static_cast<std::size_t>(num_rows), true);
+    validity[0]                                      = false;
+    validity[static_cast<std::size_t>(num_rows - 1)] = false;
+
+    auto const input_col =
+      cudf::test::strings_column_wrapper(rows.begin(), rows.end(), validity.begin());
+    auto const result = raw_map(cudf::strings_column_view{input_col});
+    EXPECT_EQ(result->null_count(), 2);
+  }
 }
 
 // ===========================================================================
@@ -712,12 +771,12 @@ TEST_F(FromJsonTest, RawMapArray_SingleQuoteNormalization)
   auto const input_col = cudf::test::strings_column_wrapper{R"({'k':['a','b']})"};
   auto const input     = cudf::strings_column_view{input_col};
 
-  auto const result =
-    spark_rapids_jni::from_json_to_raw_map_array_values(input,
-                                                        /*normalize_single_quotes=*/true,
-                                                        allow_leading_zeros,
-                                                        allow_nonnumeric_numbers,
-                                                        allow_unquoted_control);
+  auto const result = spark_rapids_jni::from_json_to_raw_map_array_values(
+    input,
+    spark_rapids_jni::json_parse_options{/*normalize_single_quotes=*/true,
+                                         allow_leading_zeros,
+                                         allow_nonnumeric_numbers,
+                                         allow_unquoted_control});
 
   auto const expected = make_expected_raw_map_array({{{"k", arr({"a", "b"})}}}, all_valid(1));
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, *expected);
@@ -729,12 +788,12 @@ TEST_F(FromJsonTest, RawMapArray_NumericLeniency)
   auto const input_col = cudf::test::strings_column_wrapper{R"({"k":[007,NaN,Infinity]})"};
   auto const input     = cudf::strings_column_view{input_col};
 
-  auto const result =
-    spark_rapids_jni::from_json_to_raw_map_array_values(input,
-                                                        normalize_single_quotes,
-                                                        /*allow_leading_zeros=*/true,
-                                                        /*allow_nonnumeric_numbers=*/true,
-                                                        allow_unquoted_control);
+  auto const result = spark_rapids_jni::from_json_to_raw_map_array_values(
+    input,
+    spark_rapids_jni::json_parse_options{normalize_single_quotes,
+                                         /*allow_leading_zeros=*/true,
+                                         /*allow_nonnumeric_numbers=*/true,
+                                         allow_unquoted_control});
 
   auto const expected =
     make_expected_raw_map_array({{{"k", arr({"007", "NaN", "Infinity"})}}}, all_valid(1));
@@ -866,5 +925,49 @@ TEST_F(FromJsonTest, RawMapArray_WideInnerList)
   auto const input     = cudf::strings_column_view{input_col};
 
   auto const expected = make_expected_raw_map_array({{{"k", arr(std::move(elems))}}}, all_valid(1));
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*raw_map_array(input), *expected);
+}
+
+// All-null-element array `{"k":[null,null,null]}` -> non-null inner list of three null elements
+// (mask #2 all-false), exercising the degenerate `el_null_count == array_len` element path.
+TEST_F(FromJsonTest, RawMapArray_AllNullElements)
+{
+  auto const input_col = cudf::test::strings_column_wrapper{R"({"k":[null,null,null]})"};
+  auto const input     = cudf::strings_column_view{input_col};
+
+  auto const expected = make_expected_raw_map_array(
+    {{{"k", arr({null_elem(), null_elem(), null_elem()})}}}, all_valid(1));
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*raw_map_array(input), *expected);
+}
+
+// allow_unquoted_control=true: a literal control char (tab) inside a quoted array element is
+// accepted and copied verbatim into the element bytes.
+TEST_F(FromJsonTest, RawMapArray_UnquotedControl)
+{
+  auto const input_col = cudf::test::strings_column_wrapper{"{\"k\":[\"a\tb\"]}"};
+  auto const input     = cudf::strings_column_view{input_col};
+
+  auto const result = spark_rapids_jni::from_json_to_raw_map_array_values(
+    input,
+    spark_rapids_jni::json_parse_options{normalize_single_quotes,
+                                         allow_leading_zeros,
+                                         allow_nonnumeric_numbers,
+                                         /*allow_unquoted_control=*/true});
+
+  auto const expected = make_expected_raw_map_array({{{"k", arr({"a\tb"})}}}, all_valid(1));
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, *expected);
+}
+
+// Sliced (nonzero-offset) input: slice off row 0 of a 3-row column and verify the 2-row result.
+// Multi-level offsets (outer + inner list) make this the most off-by-one-prone path.
+TEST_F(FromJsonTest, RawMapArray_SlicedInput)
+{
+  auto const input_col =
+    cudf::test::strings_column_wrapper{R"({"skip":[]})", R"({"k":["a"]})", R"({"k":["b"]})"};
+  auto const sliced = cudf::slice(input_col, {1, 3})[0];
+  auto const input  = cudf::strings_column_view{sliced};
+
+  auto const expected =
+    make_expected_raw_map_array({{{"k", arr({"a"})}}, {{"k", arr({"b"})}}}, all_valid(2));
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(*raw_map_array(input), *expected);
 }
