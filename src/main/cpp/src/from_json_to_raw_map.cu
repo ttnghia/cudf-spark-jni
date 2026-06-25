@@ -1350,15 +1350,17 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
       });
   }
 
-  auto [null_mask, null_count] = create_null_mask(input.size(),
-                                                  should_be_nullified,
-                                                  tokens,
-                                                  token_positions,
-                                                  node_token_ids,
-                                                  parent_node_ids,
-                                                  line_begin_indices,
-                                                  stream,
-                                                  mr);
+  auto [null_mask, null_count] =
+    create_null_mask(input.size(),
+                     should_be_nullified,
+                     tokens,
+                     token_positions,
+                     node_token_ids,
+                     parent_node_ids,
+                     cudf::device_span<NodeIndexT const>{line_begin_indices.data(),
+                                                         static_cast<std::size_t>(input.size())},
+                     stream,
+                     mr);
 
   auto result = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::LIST},
                                                input.size(),
