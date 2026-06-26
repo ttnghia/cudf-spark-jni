@@ -41,7 +41,7 @@ public class FromJsonToRawMapArrayTest {
   // Column schema for the array-valued result: LIST<STRUCT<key:STRING, value:LIST<STRING>>>.
   private static final HostColumnVector.StructType STRUCT_TYPE =
       new HostColumnVector.StructType(true,
-          new HostColumnVector.BasicType(true, DType.STRING),                              // key
+          new HostColumnVector.BasicType(false, DType.STRING),                             // key
           new HostColumnVector.ListType(true, new HostColumnVector.BasicType(true,
               DType.STRING)));                                                             // value
   private static final HostColumnVector.ListType LIST_TYPE =
@@ -76,6 +76,23 @@ public class FromJsonToRawMapArrayTest {
     }
   }
 
+  // ARRAY_OF_STRING nested validity through the public HostColumnVector path:
+  //  - {"k":null}       -> row kept, the value inner list is null (mask #1);
+  //  - {"k":[null,"x"]} -> inner list present with a null first element (mask #2).
+  // Pins that nested null lists/elements survive the JNI -> HostColumnVector round-trip.
+  @Test
+  void testExtractRawMapArrayNullListAndElement() {
+    List<HostColumnVector.StructData> row0 = Arrays.asList(pair("k", null));
+    List<HostColumnVector.StructData> row1 = Arrays.asList(pair("k", Arrays.asList(null, "x")));
+    try (ColumnVector input =
+             ColumnVector.fromStrings("{\"k\":null}", "{\"k\":[null,\"x\"]}");
+         ColumnVector result = JSONUtils.extractRawMapFromJsonString(input, getOptions(),
+             JSONUtils.MapValueType.ARRAY_OF_STRING);
+         ColumnVector expected = ColumnVector.fromLists(LIST_TYPE, row0, row1)) {
+      assertColumnsAreEqual(expected, result);
+    }
+  }
+
   // The three-argument overload with MapValueType.STRING must produce exactly what the deprecated
   // two-argument overload produces, since the latter delegates to the former with STRING.
   @Test
@@ -88,11 +105,10 @@ public class FromJsonToRawMapArrayTest {
     }
   }
 
-  // The dispatch switch rejects a value it cannot map. The MapValueType enum only declares STRING
-  // and ARRAY_OF_STRING, so the IllegalArgumentException default arm is unreachable through the
-  // public type; the closest reachable rejection is a null valueType, which the switch refuses with
-  // a NullPointerException before reaching any arm. This pins that an unmapped value is never
-  // silently accepted.
+  // A null valueType is rejected: switching on it throws NullPointerException before any arm. The
+  // MapValueType enum declares only STRING and ARRAY_OF_STRING, so the IllegalArgumentException
+  // default arm is unreachable through the typed API; null is the only reachable invalid input, and
+  // this test pins that it fails fast rather than being silently accepted.
   @Test
   void testExtractRawMapNullValueTypeRejected() {
     try (ColumnVector input = ColumnVector.fromStrings("{\"k\":\"v\"}")) {

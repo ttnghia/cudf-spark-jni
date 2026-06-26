@@ -54,11 +54,13 @@ std::unique_ptr<cudf::column> from_json_to_raw_map(
  * `List<Struct<String, List<String>>>` column in which the struct's value child is a
  * `List<String>` holding the array elements.
  *
- * A value that is `null`, a scalar, or an object (i.e. not a JSON array) produces a null inner
- * list. An array element that is the literal `null` produces a null element; every other element
- * (string, number, boolean, or a nested object/array taken as its raw JSON substring) is emitted
- * as its de-quoted raw bytes, matching `from_json_to_raw_map`'s `include_quote_char=false`
- * extraction. Row-level null/empty/invalid handling is identical to `from_json_to_raw_map`.
+ * A value that is the JSON `null` literal produces a null inner list (the map row is kept). A value
+ * that is non-null but not a JSON array (a scalar or an object) is a row-level bad record: the
+ * entire outer map row is nullified, matching Spark `from_json`. An array element that is the
+ * literal `null` produces a null element; every other element (string, number, boolean, or a nested
+ * object/array taken as its raw JSON substring) is emitted as its de-quoted raw bytes, matching
+ * `from_json_to_raw_map`'s `include_quote_char=false` extraction. Row-level null/empty/invalid
+ * handling is otherwise identical to `from_json_to_raw_map`.
  */
 std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
   cudf::strings_column_view const& input,

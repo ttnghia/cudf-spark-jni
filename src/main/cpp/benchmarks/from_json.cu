@@ -71,14 +71,11 @@ std::vector<cudf::type_id> make_all_string_column_types(int num_keys)
 //
 // Tunable parameters:
 //   - `value_width`  : exact width of every generated STRING value (NORMAL dist, lower==upper).
-//   - `null_pct`     : if > 0, fraction of null elements per column; if 0, no null mask at all.
+//   - `null_pct`     : if > 0, fraction of null elements per column; if <= 0, no null mask at all.
 //   - `key_name_len` : if <= 0, keys are "col0".."colN-1"; if > 0, keys are EXACTLY `key_name_len`
 //                      chars ("k" + zero-padded i) so longer key names can be exercised.
 //   - `row_count`    : if > 0, the table is sized by row count and `size_bytes` is ignored; else
 //   the table is sized by target byte count via `table_size_bytes`.
-//
-// `write_json(lines=true)` appends a trailing newline, so splitting on "\n" produces a trailing
-// empty string (a spurious extra row). We slice it off below before returning.
 std::unique_ptr<cudf::column> generate_input(std::size_t size_bytes,
                                              std::vector<cudf::type_id> const& column_types,
                                              int value_width       = default_value_width,
@@ -305,7 +302,7 @@ std::unique_ptr<cudf::column> generate_map_of_array_input(std::size_t num_rows,
   auto const sizes_in = thrust::make_transform_iterator(
     thrust::counting_iterator<cudf::size_type>{0},
     cuda::proclaim_return_type<int64_t>(
-      [d_sizes = sizes.data(), row_count] __device__(cudf::size_type i) -> int64_t {
+      [d_sizes = sizes.data(), row_count] __device__(cudf::size_type i) {
         return i < row_count ? static_cast<int64_t>(d_sizes[i]) : int64_t{0};
       }));
   thrust::exclusive_scan(
@@ -335,15 +332,15 @@ void BM_from_json_to_raw_map(nvbench::state& state)
   auto const json_strings = generate_input(size_bytes, make_all_string_column_types(num_keys));
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
+  state.add_global_memory_reads<nvbench::int8_t>(size_bytes);
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     [[maybe_unused]] auto const output = spark_rapids_jni::from_json_to_raw_map(
       cudf::strings_column_view{json_strings->view()},
-      spark_rapids_jni::json_parse_options{/*normalize_single_quotes=*/false,
-                                           /*allow_leading_zeros=*/true,
-                                           /*allow_nonnumeric_numbers=*/true,
-                                           /*allow_unquoted_control=*/false});
+      spark_rapids_jni::json_parse_options{.normalize_single_quotes  = false,
+                                           .allow_leading_zeros      = true,
+                                           .allow_nonnumeric_numbers = true,
+                                           .allow_unquoted_control   = false});
   });
-  state.add_global_memory_reads<nvbench::int8_t>(size_bytes);
 }
 
 // Scenario: raw_map vs string value width.
@@ -357,15 +354,15 @@ void BM_from_json_to_raw_map_value_width(nvbench::state& state)
     generate_input(size_bytes, make_all_string_column_types(num_keys), value_width);
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
+  state.add_global_memory_reads<nvbench::int8_t>(size_bytes);
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     [[maybe_unused]] auto const output = spark_rapids_jni::from_json_to_raw_map(
       cudf::strings_column_view{json_strings->view()},
-      spark_rapids_jni::json_parse_options{/*normalize_single_quotes=*/false,
-                                           /*allow_leading_zeros=*/true,
-                                           /*allow_nonnumeric_numbers=*/true,
-                                           /*allow_unquoted_control=*/false});
+      spark_rapids_jni::json_parse_options{.normalize_single_quotes  = false,
+                                           .allow_leading_zeros      = true,
+                                           .allow_nonnumeric_numbers = true,
+                                           .allow_unquoted_control   = false});
   });
-  state.add_global_memory_reads<nvbench::int8_t>(size_bytes);
 }
 
 // Scenario: raw_map vs null density.
@@ -379,15 +376,15 @@ void BM_from_json_to_raw_map_null_density(nvbench::state& state)
     size_bytes, make_all_string_column_types(num_keys), default_value_width, null_pct);
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
+  state.add_global_memory_reads<nvbench::int8_t>(size_bytes);
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     [[maybe_unused]] auto const output = spark_rapids_jni::from_json_to_raw_map(
       cudf::strings_column_view{json_strings->view()},
-      spark_rapids_jni::json_parse_options{/*normalize_single_quotes=*/false,
-                                           /*allow_leading_zeros=*/true,
-                                           /*allow_nonnumeric_numbers=*/true,
-                                           /*allow_unquoted_control=*/false});
+      spark_rapids_jni::json_parse_options{.normalize_single_quotes  = false,
+                                           .allow_leading_zeros      = true,
+                                           .allow_nonnumeric_numbers = true,
+                                           .allow_unquoted_control   = false});
   });
-  state.add_global_memory_reads<nvbench::int8_t>(size_bytes);
 }
 
 // Scenario: raw_map at sub-megabyte input sizes (fixed-overhead / launch-bound behavior).
@@ -399,15 +396,15 @@ void BM_from_json_to_raw_map_micro_size(nvbench::state& state)
   auto const json_strings = generate_input(size_bytes, make_all_string_column_types(num_keys));
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
+  state.add_global_memory_reads<nvbench::int8_t>(size_bytes);
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     [[maybe_unused]] auto const output = spark_rapids_jni::from_json_to_raw_map(
       cudf::strings_column_view{json_strings->view()},
-      spark_rapids_jni::json_parse_options{/*normalize_single_quotes=*/false,
-                                           /*allow_leading_zeros=*/true,
-                                           /*allow_nonnumeric_numbers=*/true,
-                                           /*allow_unquoted_control=*/false});
+      spark_rapids_jni::json_parse_options{.normalize_single_quotes  = false,
+                                           .allow_leading_zeros      = true,
+                                           .allow_nonnumeric_numbers = true,
+                                           .allow_unquoted_control   = false});
   });
-  state.add_global_memory_reads<nvbench::int8_t>(size_bytes);
 }
 
 // Scenario: raw_map across row shapes at roughly constant total bytes.
@@ -417,16 +414,18 @@ void BM_from_json_to_raw_map_row_shape(nvbench::state& state)
   auto const shape       = state.get_string("shape");
 
   std::size_t row_count_ = 0;
-  int value_width        = default_value_width;
+  int value_width        = 0;
   if (shape == "few_wide") {
     row_count_  = 2'000;
     value_width = 2'000;
   } else if (shape == "balanced") {
     row_count_  = 40'000;
     value_width = 100;
-  } else {  // "many_narrow"
+  } else if (shape == "many_narrow") {
     row_count_  = 4'000'000;
     value_width = 1;
+  } else {
+    CUDF_FAIL("Unknown shape: " + shape);
   }
 
   auto const json_strings = generate_input(/*size_bytes=*/0,
@@ -437,15 +436,15 @@ void BM_from_json_to_raw_map_row_shape(nvbench::state& state)
                                            row_count_);
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
+  state.add_global_memory_reads<nvbench::int8_t>(input_char_bytes(json_strings->view()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     [[maybe_unused]] auto const output = spark_rapids_jni::from_json_to_raw_map(
       cudf::strings_column_view{json_strings->view()},
-      spark_rapids_jni::json_parse_options{/*normalize_single_quotes=*/false,
-                                           /*allow_leading_zeros=*/true,
-                                           /*allow_nonnumeric_numbers=*/true,
-                                           /*allow_unquoted_control=*/false});
+      spark_rapids_jni::json_parse_options{.normalize_single_quotes  = false,
+                                           .allow_leading_zeros      = true,
+                                           .allow_nonnumeric_numbers = true,
+                                           .allow_unquoted_control   = false});
   });
-  state.add_global_memory_reads<nvbench::int8_t>(input_char_bytes(json_strings->view()));
 }
 
 // Scenario: raw_map vs key-name length.
@@ -462,15 +461,15 @@ void BM_from_json_to_raw_map_key_name_len(nvbench::state& state)
                                            key_name_len);
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
+  state.add_global_memory_reads<nvbench::int8_t>(size_bytes);
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     [[maybe_unused]] auto const output = spark_rapids_jni::from_json_to_raw_map(
       cudf::strings_column_view{json_strings->view()},
-      spark_rapids_jni::json_parse_options{/*normalize_single_quotes=*/false,
-                                           /*allow_leading_zeros=*/true,
-                                           /*allow_nonnumeric_numbers=*/true,
-                                           /*allow_unquoted_control=*/false});
+      spark_rapids_jni::json_parse_options{.normalize_single_quotes  = false,
+                                           .allow_leading_zeros      = true,
+                                           .allow_nonnumeric_numbers = true,
+                                           .allow_unquoted_control   = false});
   });
-  state.add_global_memory_reads<nvbench::int8_t>(size_bytes);
 }
 
 // Map-of-array engine: parses MapType[String, Array[String]] JSON into the
@@ -486,15 +485,15 @@ void BM_from_json_to_raw_map_array_values(nvbench::state& state)
   auto const json_strings = generate_map_of_array_input(num_rows, keys_per_row, array_len);
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
+  state.add_global_memory_reads<nvbench::int8_t>(input_char_bytes(json_strings->view()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     [[maybe_unused]] auto const output = spark_rapids_jni::from_json_to_raw_map_array_values(
       cudf::strings_column_view{json_strings->view()},
-      spark_rapids_jni::json_parse_options{/*normalize_single_quotes=*/false,
-                                           /*allow_leading_zeros=*/true,
-                                           /*allow_nonnumeric_numbers=*/true,
-                                           /*allow_unquoted_control=*/false});
+      spark_rapids_jni::json_parse_options{.normalize_single_quotes  = false,
+                                           .allow_leading_zeros      = true,
+                                           .allow_nonnumeric_numbers = true,
+                                           .allow_unquoted_control   = false});
   });
-  state.add_global_memory_reads<nvbench::int8_t>(input_char_bytes(json_strings->view()));
 }
 
 // Scenario: map-of-array vs null density. Two independent axes drive the value-null (null inner
@@ -512,15 +511,15 @@ void BM_from_json_to_raw_map_array_values_null_density(nvbench::state& state)
     num_rows, keys_per_row, array_len, element_null_pct, value_null_pct);
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
+  state.add_global_memory_reads<nvbench::int8_t>(input_char_bytes(json_strings->view()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     [[maybe_unused]] auto const output = spark_rapids_jni::from_json_to_raw_map_array_values(
       cudf::strings_column_view{json_strings->view()},
-      spark_rapids_jni::json_parse_options{/*normalize_single_quotes=*/false,
-                                           /*allow_leading_zeros=*/true,
-                                           /*allow_nonnumeric_numbers=*/true,
-                                           /*allow_unquoted_control=*/false});
+      spark_rapids_jni::json_parse_options{.normalize_single_quotes  = false,
+                                           .allow_leading_zeros      = true,
+                                           .allow_nonnumeric_numbers = true,
+                                           .allow_unquoted_control   = false});
   });
-  state.add_global_memory_reads<nvbench::int8_t>(input_char_bytes(json_strings->view()));
 }
 
 // Scenario: map-of-array vs keys (map entries) per row.
@@ -533,15 +532,15 @@ void BM_from_json_to_raw_map_array_values_keys_per_row(nvbench::state& state)
   auto const json_strings = generate_map_of_array_input(num_rows, keys_per_row, array_len);
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
+  state.add_global_memory_reads<nvbench::int8_t>(input_char_bytes(json_strings->view()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     [[maybe_unused]] auto const output = spark_rapids_jni::from_json_to_raw_map_array_values(
       cudf::strings_column_view{json_strings->view()},
-      spark_rapids_jni::json_parse_options{/*normalize_single_quotes=*/false,
-                                           /*allow_leading_zeros=*/true,
-                                           /*allow_nonnumeric_numbers=*/true,
-                                           /*allow_unquoted_control=*/false});
+      spark_rapids_jni::json_parse_options{.normalize_single_quotes  = false,
+                                           .allow_leading_zeros      = true,
+                                           .allow_nonnumeric_numbers = true,
+                                           .allow_unquoted_control   = false});
   });
-  state.add_global_memory_reads<nvbench::int8_t>(input_char_bytes(json_strings->view()));
 }
 
 // Scenario: map-of-array vs key-name length (mirrors the scalar-path key_name_len sweep).
@@ -561,15 +560,15 @@ void BM_from_json_to_raw_map_array_values_key_name_len(nvbench::state& state)
                                                         key_name_len);
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
+  state.add_global_memory_reads<nvbench::int8_t>(input_char_bytes(json_strings->view()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     [[maybe_unused]] auto const output = spark_rapids_jni::from_json_to_raw_map_array_values(
       cudf::strings_column_view{json_strings->view()},
-      spark_rapids_jni::json_parse_options{/*normalize_single_quotes=*/false,
-                                           /*allow_leading_zeros=*/true,
-                                           /*allow_nonnumeric_numbers=*/true,
-                                           /*allow_unquoted_control=*/false});
+      spark_rapids_jni::json_parse_options{.normalize_single_quotes  = false,
+                                           .allow_leading_zeros      = true,
+                                           .allow_nonnumeric_numbers = true,
+                                           .allow_unquoted_control   = false});
   });
-  state.add_global_memory_reads<nvbench::int8_t>(input_char_bytes(json_strings->view()));
 }
 
 // Scenario: map-of-array vs type-mismatch density. Injecting scalar (non-array, non-null) values
@@ -591,17 +590,29 @@ void BM_from_json_to_raw_map_array_values_type_mismatch(nvbench::state& state)
                                                         mismatch_pct);
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
+  state.add_global_memory_reads<nvbench::int8_t>(input_char_bytes(json_strings->view()));
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     [[maybe_unused]] auto const output = spark_rapids_jni::from_json_to_raw_map_array_values(
       cudf::strings_column_view{json_strings->view()},
-      spark_rapids_jni::json_parse_options{/*normalize_single_quotes=*/false,
-                                           /*allow_leading_zeros=*/true,
-                                           /*allow_nonnumeric_numbers=*/true,
-                                           /*allow_unquoted_control=*/false});
+      spark_rapids_jni::json_parse_options{.normalize_single_quotes  = false,
+                                           .allow_leading_zeros      = true,
+                                           .allow_nonnumeric_numbers = true,
+                                           .allow_unquoted_control   = false});
   });
-  state.add_global_memory_reads<nvbench::int8_t>(input_char_bytes(json_strings->view()));
 }
 
+// ============================================================================================
+// Benchmark roles.
+//   PERF-OPTIMIZATION TARGETS -- profile/tune the array-path kernel against these three:
+//     from_json_to_raw_map_array_values (all-valid throughput),
+//     from_json_to_raw_map_array_values_null_density (null-mask construction),
+//     from_json_to_raw_map_array_values_type_mismatch (row nullification + purge_nonempty_nulls).
+//   Every other benchmark is VERIFICATION ONLY -- run to catch regressions / characterize
+//   behavior, never as a tuning target.
+//
+// Verification -- MAP<STRING,STRING> path: regression-guards the shared token-tree prelude so the
+// existing from_json_to_raw_map kernel is not slowed by the code now shared with the array path.
+// ============================================================================================
 NVBENCH_BENCH(BM_from_json_to_raw_map)
   .set_name("from_json_to_raw_map")
   .add_int64_axis("size_bytes", {1'000'000, 10'000'000, 100'000'000})
@@ -627,16 +638,23 @@ NVBENCH_BENCH(BM_from_json_to_raw_map_key_name_len)
   .set_name("from_json_to_raw_map_key_name_len")
   .add_int64_axis("key_name_len", {3, 16, 64});
 
+// [PERF-OPTIMIZATION TARGET] Canonical array-path throughput -- the primary tuning benchmark.
+// num_rows tops out at 1M: the value-strings output holds num_rows * keys_per_row(5) * array_len
+// strings, which must fit cudf's 2^31 column-size limit. At 10M rows the array_len 3 and 10 cells
+// overflow it, so 1M is the largest count that keeps every array_len cell in range.
 NVBENCH_BENCH(BM_from_json_to_raw_map_array_values)
   .set_name("from_json_to_raw_map_array_values")
   .add_int64_axis("array_len", {1, 3, 10})
-  .add_int64_axis("num_rows", {100'000, 1'000'000, 10'000'000});
+  .add_int64_axis("num_rows", {100'000, 1'000'000});
 
+// [PERF-OPTIMIZATION TARGET] Null-mask construction (value/element validity) -- tune against this.
 NVBENCH_BENCH(BM_from_json_to_raw_map_array_values_null_density)
   .set_name("from_json_to_raw_map_array_values_null_density")
   .add_int64_axis("value_null_pct", {0, 10, 50})
   .add_int64_axis("element_null_pct", {0, 10, 50});
 
+// Verification -- array-path characterization (key count / key length sensitivity). Not a tuning
+// target; run to confirm no behavioral regression across these axes.
 NVBENCH_BENCH(BM_from_json_to_raw_map_array_values_keys_per_row)
   .set_name("from_json_to_raw_map_array_values_keys_per_row")
   .add_int64_axis("keys_per_row", {2, 5, 10});
@@ -645,6 +663,7 @@ NVBENCH_BENCH(BM_from_json_to_raw_map_array_values_key_name_len)
   .set_name("from_json_to_raw_map_array_values_key_name_len")
   .add_int64_axis("key_name_len", {4, 16, 64});
 
+// [PERF-OPTIMIZATION TARGET] Row nullification + purge_nonempty_nulls -- tune against this.
 NVBENCH_BENCH(BM_from_json_to_raw_map_array_values_type_mismatch)
   .set_name("from_json_to_raw_map_array_values_type_mismatch")
   .add_int64_axis("mismatch_pct", {0, 10, 50});

@@ -148,10 +148,11 @@ OutputIterator copy_if(InputIterator begin,
 // Build a zero-row `List<Struct<String, V>>` from an already-constructed empty value child. The
 // value-child type selects the map flavor: an empty `STRING` gives `make_empty_map`'s output, an
 // empty `List<String>` gives `make_empty_map_array`'s.
-std::unique_ptr<cudf::column> make_empty_map_with_value(std::unique_ptr<cudf::column> value_child,
+std::unique_ptr<cudf::column> make_empty_map_from_value(std::unique_ptr<cudf::column> value_child,
                                                         rmm::cuda_stream_view stream,
                                                         rmm::device_async_resource_ref mr)
 {
+  CUDF_EXPECTS(value_child->size() == 0, "value_child must be an empty column.");
   auto keys = cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
   std::vector<std::unique_ptr<cudf::column>> out_keys_vals;
   out_keys_vals.emplace_back(std::move(keys));
@@ -165,7 +166,7 @@ std::unique_ptr<cudf::column> make_empty_map_with_value(std::unique_ptr<cudf::co
 std::unique_ptr<cudf::column> make_empty_map(rmm::cuda_stream_view stream,
                                              rmm::device_async_resource_ref mr)
 {
-  return make_empty_map_with_value(
+  return make_empty_map_from_value(
     cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING}), stream, mr);
 }
 
@@ -401,6 +402,14 @@ rmm::device_uvector<NodeIndexT> compute_parent_node_ids(
 // Special values to denote if a node is a key or value to extract for the output.
 constexpr int8_t key_sentinel{1};
 constexpr int8_t value_sentinel{2};
+// Sentinel marking a node that is a direct element of a value array. Distinct from the key/value
+// sentinels so the reused `extract_keys_or_values` can select elements.
+constexpr int8_t element_sentinel{3};
+
+// Per-token list-nesting weight for the nested-range balance scan. libcudf bounds JSON tree depth
+// to 127 (`TreeDepthT` is `int8_t`), so a weight of 256 keeps list nesting (+/-256) from colliding
+// with struct nesting (+/-1) when a running delta sum locates a nested node's matching close.
+constexpr int32_t list_nesting_weight{1 << 8};
 
 // Check for each node if it is a key or a value field.
 rmm::device_uvector<int8_t> check_key_or_value_nodes(
@@ -512,15 +521,61 @@ tokenized_input tokenize_and_classify(cudf::strings_column_view const& input,
   // Check for each node if it is a map key or a map value to extract.
   auto is_key_or_value_node = check_key_or_value_nodes(parent_node_ids, stream);
 
-  return tokenized_input{std::move(concat_buff_wrapper),
-                         preprocessed_input,
-                         std::move(tokens),
-                         std::move(token_positions),
-                         std::move(should_be_nullified),
-                         num_nodes,
-                         std::move(node_token_ids),
-                         std::move(parent_node_ids),
-                         std::move(is_key_or_value_node)};
+  return {std::move(concat_buff_wrapper),
+          preprocessed_input,
+          std::move(tokens),
+          std::move(token_positions),
+          std::move(should_be_nullified),
+          num_nodes,
+          std::move(node_token_ids),
+          std::move(parent_node_ids),
+          std::move(is_key_or_value_node)};
+}
+
+// The end-of-* partner token for a given begin-of-* token.
+__device__ inline token_t end_of_partner(PdaTokenT const tk)
+{
+  switch (tk) {
+    case token_t::StructBegin: return token_t::StructEnd;
+    case token_t::ListBegin: return token_t::ListEnd;
+    case token_t::StringBegin: return token_t::StringEnd;
+    case token_t::ValueBegin: return token_t::ValueEnd;
+    case token_t::FieldNameBegin: return token_t::FieldNameEnd;
+    default: return token_t::ErrorBegin;
+  };
+}
+
+// Per-token nesting-depth delta (struct +/-1, list +/-list_nesting_weight) so a running sum hits 0
+// at a nested node's matching close; the distinct magnitudes stop a struct close balancing a list
+// open.
+__device__ inline int32_t nested_node_to_value(PdaTokenT const tk)
+{
+  switch (tk) {
+    case token_t::StructBegin: return 1;
+    case token_t::StructEnd: return -1;
+    case token_t::ListBegin: return list_nesting_weight;
+    case token_t::ListEnd: return -list_nesting_weight;
+    default: return 0;
+  };
+}
+
+// Walk from the begin token at `token_idx` to its matching close, using the per-token nesting-depth
+// delta so a running sum returns to zero at the matching close. Returns the close token's index, or
+// `tokens.size()` if the tokens are unbalanced (debug builds assert). The caller dequotes the
+// returned token to obtain the range end.
+__device__ inline NodeIndexT matching_close_index(cudf::device_span<PdaTokenT const> tokens,
+                                                  NodeIndexT const token_idx)
+{
+  auto nested_range_value = nested_node_to_value(tokens[token_idx]);
+  auto end_idx            = token_idx + 1;
+  while (end_idx < tokens.size()) {
+    nested_range_value += nested_node_to_value(tokens[end_idx]);
+    if (nested_range_value == 0) { break; }
+    ++end_idx;
+  }
+  cudf_assert(nested_range_value == 0 && "Nested range never closed (unbalanced tokens).");
+  cudf_assert((end_idx + 1 < tokens.size()) && "Nested close must be followed by more tokens.");
+  return end_idx;
 }
 
 // Convert token positions to node ranges for each valid node.
@@ -545,31 +600,6 @@ struct node_ranges_fn {
           case token_t::ValueBegin:
           case token_t::FieldNameBegin: return true;
           default: return false;
-        };
-      });
-
-    // The end-of-* partner token for a given beginning-of-* token
-    auto const end_of_partner =
-      cuda::proclaim_return_type<token_t>([] __device__(PdaTokenT const token) {
-        switch (token) {
-          case token_t::StructBegin: return token_t::StructEnd;
-          case token_t::ListBegin: return token_t::ListEnd;
-          case token_t::StringBegin: return token_t::StringEnd;
-          case token_t::ValueBegin: return token_t::ValueEnd;
-          case token_t::FieldNameBegin: return token_t::FieldNameEnd;
-          default: return token_t::ErrorBegin;
-        };
-      });
-
-    // Encode a fixed value for nested node types (list+struct).
-    auto const nested_node_to_value =
-      cuda::proclaim_return_type<int32_t>([] __device__(PdaTokenT const token) -> int32_t {
-        switch (token) {
-          case token_t::StructBegin: return 1;
-          case token_t::StructEnd: return -1;
-          case token_t::ListBegin: return 1 << 8;
-          case token_t::ListEnd: return -(1 << 8);
-          default: return 0;
         };
       });
 
@@ -604,18 +634,10 @@ struct node_ranges_fn {
       // Update the range_end for this pair of tokens
       range_end = get_token_position(tokens[token_idx + 1], token_positions[token_idx + 1]);
     } else {
-      auto nested_range_value = nested_node_to_value(token);  // iterate until this is zero
-      auto end_idx            = token_idx + 1;
-      while (end_idx < tokens.size()) {
-        nested_range_value += nested_node_to_value(tokens[end_idx]);
-        if (nested_range_value == 0) {
-          range_end = get_token_position(tokens[end_idx], token_positions[end_idx]) + 1;
-          break;
-        }
-        ++end_idx;
+      auto const end_idx = matching_close_index(tokens, token_idx);
+      if (end_idx < tokens.size()) {
+        range_end = get_token_position(tokens[end_idx], token_positions[end_idx]) + 1;
       }
-      cudf_assert(nested_range_value == 0 && "Invalid range computation.");
-      cudf_assert((end_idx + 1 < tokens.size()) && "Invalid range computation.");
     }
     return {range_begin, range_end};
   }
@@ -891,10 +913,6 @@ std::pair<rmm::device_buffer, cudf::size_type> create_null_mask(
 // Array-value path: parse `Map[String, Array[String]]` JSON into
 // `List<Struct<String, List<String>>>`, reusing the shared device helpers above.
 
-// Sentinel marking a node that is a direct element of a value array. Distinct from `key_sentinel`
-// (1) and `value_sentinel` (2) so the reused `extract_keys_or_values` can select elements.
-constexpr int8_t element_sentinel{3};
-
 // True iff the byte range `[begin, end)` of `json` is exactly the 4-byte literal `null`. Callers
 // gate on a `ValueBegin` token first, so a JSON STRING "null" (a `StringBegin`) never reaches here;
 // the length-4 guard separates the literal from a 4-byte number like `1000`.
@@ -912,7 +930,7 @@ __device__ inline bool is_json_null_literal(char const* json,
 std::unique_ptr<cudf::column> make_empty_map_array(rmm::cuda_stream_view stream,
                                                    rmm::device_async_resource_ref mr)
 {
-  return make_empty_map_with_value(
+  return make_empty_map_from_value(
     cudf::make_empty_lists_column(cudf::data_type{cudf::type_id::STRING}), stream, mr);
 }
 
@@ -934,33 +952,9 @@ struct element_classify_fn {
   cuda::std::pair<SymbolOffsetT, SymbolOffsetT>* element_ranges;
   bool* element_valid;
 
-  // The end-of-* partner token for a given beginning-of-* token.
-  static __device__ token_t end_of_partner(PdaTokenT const tk)
-  {
-    switch (tk) {
-      case token_t::StructBegin: return token_t::StructEnd;
-      case token_t::ListBegin: return token_t::ListEnd;
-      case token_t::StringBegin: return token_t::StringEnd;
-      case token_t::ValueBegin: return token_t::ValueEnd;
-      case token_t::FieldNameBegin: return token_t::FieldNameEnd;
-      default: return token_t::ErrorBegin;
-    };
-  }
-
-  // Per-token nesting-depth delta (struct +/-1, list +/-256) so a running sum hits 0 at the node's
-  // matching close; the distinct magnitudes stop a struct close balancing a list open.
-  static __device__ int32_t nested_node_to_value(PdaTokenT const tk)
-  {
-    switch (tk) {
-      case token_t::StructBegin: return 1;
-      case token_t::StructEnd: return -1;
-      case token_t::ListBegin: return 1 << 8;
-      case token_t::ListEnd: return -(1 << 8);
-      default: return 0;
-    };
-  }
-
-  // Strip the opening/closing quote for string elements; leave literals/values verbatim.
+  // Element byte range drops the surrounding quotes: the opening quote is skipped (StringBegin
+  // advances one byte) and the closing quote is excluded by ending at the unadvanced StringEnd
+  // position. Literals/values keep their position verbatim.
   static __device__ SymbolOffsetT get_token_position(PdaTokenT const tk, SymbolOffsetT const pos)
   {
     constexpr SymbolOffsetT quote_char_size = 1;
@@ -997,20 +991,11 @@ struct element_classify_fn {
     if ((token_idx + 1) < tokens.size() && end_of_partner(token) == tokens[token_idx + 1]) {
       range_end = get_token_position(tokens[token_idx + 1], token_positions[token_idx + 1]);
     } else {
-      // Nested element (`[`/`{`): its end token isn't adjacent, so span to the matching close
-      // using the nesting-depth delta.
-      auto nested_range_value = nested_node_to_value(token);
-      auto end_idx            = token_idx + 1;
-      while (end_idx < tokens.size()) {
-        nested_range_value += nested_node_to_value(tokens[end_idx]);
-        if (nested_range_value == 0) {
-          range_end = get_token_position(tokens[end_idx], token_positions[end_idx]) + 1;
-          break;
-        }
-        ++end_idx;
+      // Nested element (`[`/`{`): its end token isn't adjacent, so span to the matching close.
+      auto const end_idx = matching_close_index(tokens, token_idx);
+      if (end_idx < tokens.size()) {
+        range_end = get_token_position(tokens[end_idx], token_positions[end_idx]) + 1;
       }
-      cudf_assert(nested_range_value == 0 && "Invalid element range computation.");
-      cudf_assert((end_idx + 1 < tokens.size()) && "Invalid element range computation.");
     }
 
     element_flag[node_id]   = element_sentinel;
