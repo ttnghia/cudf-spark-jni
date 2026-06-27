@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <format>
 #include <memory>
 #include <optional>
 #include <string>
@@ -69,18 +70,18 @@ std::unique_ptr<cudf::column> make_expected_raw_map(std::vector<std::vector<kv>>
   CUDF_EXPECTS(rows.size() == row_valid.size(),
                "make_expected_raw_map: rows and row_valid size mismatch");
 
-  auto const num_rows = static_cast<cudf::size_type>(rows.size());
+  auto const num_rows = rows.size();
 
   std::vector<std::string> flat_keys;
   std::vector<std::string> flat_values;
   std::vector<cudf::size_type> offsets{0};
-  offsets.reserve(static_cast<std::size_t>(num_rows) + 1);
+  offsets.reserve(num_rows + 1);
 
   cudf::size_type running = 0;
-  for (cudf::size_type r = 0; r < num_rows; ++r) {
+  for (std::size_t r = 0; r < num_rows; ++r) {
     // A null row contributes no children entries (the list slot is masked out).
-    if (row_valid[static_cast<std::size_t>(r)]) {
-      for (auto const& [k, v] : rows[static_cast<std::size_t>(r)]) {
+    if (row_valid[r]) {
+      for (auto const& [k, v] : rows[r]) {
         flat_keys.push_back(k);
         flat_values.push_back(v);
         ++running;
@@ -100,7 +101,7 @@ std::unique_ptr<cudf::column> make_expected_raw_map(std::vector<std::vector<kv>>
   auto [null_mask, null_count] = cudf::bools_to_mask(
     cudf::test::fixed_width_column_wrapper<bool>(row_valid.begin(), row_valid.end()));
 
-  return cudf::make_lists_column(num_rows,
+  return cudf::make_lists_column(static_cast<cudf::size_type>(num_rows),
                                  std::move(offsets_col),
                                  std::move(structs_child),
                                  null_count,
@@ -164,10 +165,10 @@ TEST_F(FromJsonTest, RawMapOpt_ManyKeys)
       std::vector<kv> pairs;
       pairs.reserve(static_cast<std::size_t>(num_keys));
       for (int k = 0; k < num_keys; ++k) {
-        auto const key = "k" + std::to_string(k);
-        auto const val = "v" + std::to_string(r) + "_" + std::to_string(k);
+        auto const key = std::format("k{}", k);
+        auto const val = std::format("v{}_{}", r, k);
         if (k > 0) { obj += ","; }
-        obj += "\"" + key + "\":\"" + val + "\"";
+        obj += std::format(R"("{}":"{}")", key, val);
         pairs.emplace_back(key, val);
       }
       obj += "}";
@@ -367,10 +368,7 @@ TEST_F(FromJsonTest, RawMapOpt_StressInvariantsWithBadRows)
   std::vector<int> const bad_rows{0, 7, 25000, 49998};
 
   auto const is_in = [](std::vector<int> const& v, int x) {
-    for (int const e : v) {
-      if (e == x) { return true; }
-    }
-    return false;
+    return std::ranges::find(v, x) != v.end();
   };
 
   std::vector<std::string> rows;
@@ -392,8 +390,7 @@ TEST_F(FromJsonTest, RawMapOpt_StressInvariantsWithBadRows)
     std::string obj = "{";
     for (int k = 0; k < num_keys; ++k) {
       if (k > 0) { obj += ","; }
-      obj +=
-        "\"key" + std::to_string(k) + "\":\"r" + std::to_string(r) + "k" + std::to_string(k) + "\"";
+      obj += std::format(R"("key{}":"r{}k{}")", k, r, k);
     }
     obj += "}";
     rows.push_back(std::move(obj));
@@ -425,8 +422,8 @@ TEST_F(FromJsonTest, RawMapOpt_EmptyInput)
   ASSERT_EQ(structs_view.type().id(), cudf::type_id::STRUCT);
   ASSERT_EQ(structs_view.num_children(), 2);
   auto const scv = cudf::structs_column_view{structs_view};
-  EXPECT_EQ(scv.child(0).type().id(), cudf::type_id::STRING);  // keys.
-  EXPECT_EQ(scv.child(1).type().id(), cudf::type_id::STRING);  // string value.
+  EXPECT_EQ(scv.child(0).type().id(), cudf::type_id::STRING);  // key.
+  EXPECT_EQ(scv.child(1).type().id(), cudf::type_id::STRING);  // value.
 }
 
 // allow_unquoted_control=true: a literal control char (tab) inside a quoted value is accepted and
@@ -512,7 +509,7 @@ std::unique_ptr<cudf::column> make_expected_raw_map_array(std::vector<std::vecto
   CUDF_EXPECTS(rows.size() == row_valid.size(),
                "make_expected_raw_map_array: rows and row_valid size mismatch");
 
-  auto const num_rows = static_cast<cudf::size_type>(rows.size());
+  auto const num_rows = rows.size();
 
   std::vector<std::string> flat_keys;
   std::vector<std::string> flat_elements;      // String child content (placeholder for null elems).
@@ -520,16 +517,16 @@ std::unique_ptr<cudf::column> make_expected_raw_map_array(std::vector<std::vecto
   std::vector<bool> inner_valid;               // Mask #1 per (key,value) pair.
   std::vector<cudf::size_type> inner_offsets;  // length num_pairs + 1.
   std::vector<cudf::size_type> outer_offsets;  // length num_rows + 1.
-  outer_offsets.reserve(static_cast<std::size_t>(num_rows) + 1);
+  outer_offsets.reserve(num_rows + 1);
 
   inner_offsets.push_back(0);
   outer_offsets.push_back(0);
 
   cudf::size_type pair_running = 0;
   cudf::size_type elem_running = 0;
-  for (cudf::size_type r = 0; r < num_rows; ++r) {
-    if (row_valid[static_cast<std::size_t>(r)]) {
-      for (auto const& [k, arr] : rows[static_cast<std::size_t>(r)]) {
+  for (std::size_t r = 0; r < num_rows; ++r) {
+    if (row_valid[r]) {
+      for (auto const& [k, arr] : rows[r]) {
         flat_keys.push_back(k);
         inner_valid.push_back(arr.has_value());
         if (arr.has_value()) {
@@ -586,7 +583,7 @@ std::unique_ptr<cudf::column> make_expected_raw_map_array(std::vector<std::vecto
     cudf::test::fixed_width_column_wrapper<bool>(row_valid.begin(), row_valid.end()));
 
   return cudf::make_lists_column(
-    num_rows,
+    static_cast<cudf::size_type>(num_rows),
     std::move(outer_offsets_col),
     std::move(structs_child),
     outer_null_count,
@@ -829,10 +826,10 @@ TEST_F(FromJsonTest, RawMapArray_ManyKeys)
   std::vector<kva> pairs;
   pairs.reserve(num_keys);
   for (int k = 0; k < num_keys; ++k) {
-    auto const key = "k" + std::to_string(k);
+    auto const key = std::format("k{}", k);
     if (k > 0) { obj += ","; }
-    obj += "\"" + key + "\":[\"v" + std::to_string(k) + "\"]";
-    pairs.emplace_back(key, arr({"v" + std::to_string(k)}));
+    obj += std::format(R"("{}":["v{}"])", key, k);
+    pairs.emplace_back(key, arr({std::format("v{}", k)}));
   }
   obj += "}";
 
@@ -906,7 +903,7 @@ TEST_F(FromJsonTest, RawMapArray_EmptyInput)
   ASSERT_EQ(structs_view.type().id(), cudf::type_id::STRUCT);
   ASSERT_EQ(structs_view.num_children(), 2);
   auto const scv = cudf::structs_column_view{structs_view};
-  EXPECT_EQ(scv.child(0).type().id(), cudf::type_id::STRING);  // keys.
+  EXPECT_EQ(scv.child(0).type().id(), cudf::type_id::STRING);  // key.
   ASSERT_EQ(scv.child(1).type().id(), cudf::type_id::LIST);    // value List<String>.
   EXPECT_EQ(cudf::lists_column_view{scv.child(1)}.child().type().id(), cudf::type_id::STRING);
 }
@@ -922,8 +919,8 @@ TEST_F(FromJsonTest, RawMapArray_WideInnerList)
   elems.reserve(num_elems);
   for (int e = 0; e < num_elems; ++e) {
     if (e > 0) { obj += ","; }
-    obj += "\"e" + std::to_string(e) + "\"";
-    elems.emplace_back("e" + std::to_string(e));
+    obj += std::format(R"("e{}")", e);
+    elems.emplace_back(std::format("e{}", e));
   }
   obj += "]}";
 

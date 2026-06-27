@@ -83,7 +83,7 @@ std::unique_ptr<cudf::column> generate_input(std::size_t size_bytes,
                                              int key_name_len      = 0,
                                              std::size_t row_count = 0)
 {
-  auto const num_keys = static_cast<int>(column_types.size());
+  auto const num_keys = column_types.size();
 
   auto profile_builder = data_profile_builder().distribution(
     cudf::type_id::STRING, distribution_id::NORMAL, value_width, value_width);
@@ -107,7 +107,7 @@ std::unique_ptr<cudf::column> generate_input(std::size_t size_bytes,
   // exactly `key_name_len` characters.
   std::vector<cudf::io::column_name_info> column_names(num_keys);
   if (key_name_len <= 0) {
-    for (int i = 0; i < num_keys; ++i) {
+    for (std::size_t i = 0; i < num_keys; ++i) {
       column_names[i].name = "col" + std::to_string(i);
     }
   } else {
@@ -115,15 +115,15 @@ std::unique_ptr<cudf::column> generate_input(std::size_t size_bytes,
     CUDF_EXPECTS(num_digits > 0, "key_name_len must be at least 2 to hold 'k' plus one digit");
     // The largest index (num_keys - 1) must fit in `num_digits` decimal digits without truncation.
     auto max_representable = std::size_t{1};
-    for (int d = 0; d < num_digits && max_representable < static_cast<std::size_t>(num_keys); ++d) {
+    for (int d = 0; d < num_digits && max_representable < num_keys; ++d) {
       max_representable *= 10;
     }
-    CUDF_EXPECTS(static_cast<std::size_t>(num_keys) <= max_representable,
+    CUDF_EXPECTS(num_keys <= max_representable,
                  "key_name_len has too few digits to keep all key names unique");
-    std::vector<char> name_buf(static_cast<std::size_t>(key_name_len) + 1);
-    for (int i = 0; i < num_keys; ++i) {
-      std::snprintf(name_buf.data(), name_buf.size(), "k%0*d", num_digits, i);
-      column_names[i].name = std::string{name_buf.data()};
+    std::string name_str(static_cast<std::size_t>(key_name_len), '\0');
+    for (std::size_t i = 0; i < num_keys; ++i) {
+      std::snprintf(name_str.data(), name_str.size() + 1, "k%0*d", num_digits, static_cast<int>(i));
+      column_names[i].name = name_str;
     }
   }
 
@@ -411,22 +411,19 @@ void BM_from_json_to_raw_map_micro_size(nvbench::state& state)
 void BM_from_json_to_raw_map_row_shape(nvbench::state& state)
 {
   constexpr int num_keys = 8;
-  auto const shape       = state.get_string("shape");
 
-  std::size_t row_count_ = 0;
-  int value_width        = 0;
-  if (shape == "few_wide") {
-    row_count_  = 2'000;
-    value_width = 2'000;
-  } else if (shape == "balanced") {
-    row_count_  = 40'000;
-    value_width = 100;
-  } else if (shape == "many_narrow") {
-    row_count_  = 4'000'000;
-    value_width = 1;
-  } else {
+  // Single-assignment via an immediately-invoked lambda: each shape maps to one (row_count,
+  // value_width) pair, kept const so they can't drift apart.
+  struct shape_params {
+    std::size_t row_count;
+    int value_width;
+  };
+  auto const [row_count_, value_width] = [shape = state.get_string("shape")]() -> shape_params {
+    if (shape == "few_wide") { return {.row_count = 2'000, .value_width = 2'000}; }
+    if (shape == "balanced") { return {.row_count = 40'000, .value_width = 100}; }
+    if (shape == "many_narrow") { return {.row_count = 4'000'000, .value_width = 1}; }
     CUDF_FAIL("Unknown shape: " + shape);
-  }
+  }();
 
   auto const json_strings = generate_input(/*size_bytes=*/0,
                                            make_all_string_column_types(num_keys),
