@@ -154,6 +154,7 @@ TEST_F(FromJsonTest, RawMapOpt_SingleKeySingleRow)
 TEST_F(FromJsonTest, RawMapOpt_ManyKeys)
 {
   for (int const num_keys : {8, 32, 64}) {
+    SCOPED_TRACE(std::format("num_keys={}", num_keys));
     constexpr int num_rows = 3;
     std::vector<std::string> input_rows;
     std::vector<std::vector<kv>> expected_rows;
@@ -461,6 +462,7 @@ TEST_F(FromJsonTest, RawMapOpt_SlicedInput)
 TEST_F(FromJsonTest, RawMapOpt_WarpBoundaryNullMask)
 {
   for (int const num_rows : {31, 32, 33, 65}) {
+    SCOPED_TRACE(std::format("num_rows={}", num_rows));
     std::vector<std::string> rows(static_cast<std::size_t>(num_rows), R"({"k":"v"})");
     std::vector<bool> validity(static_cast<std::size_t>(num_rows), true);
     validity[0]                                      = false;
@@ -518,6 +520,12 @@ std::unique_ptr<cudf::column> make_expected_raw_map_array(std::vector<std::vecto
   std::vector<cudf::size_type> inner_offsets;  // length num_pairs + 1.
   std::vector<cudf::size_type> outer_offsets;  // length num_rows + 1.
   outer_offsets.reserve(num_rows + 1);
+  // inner_offsets holds one entry per (key,value) pair plus the leading 0.
+  std::size_t total_pairs = 0;
+  for (auto const& row : rows) {
+    total_pairs += row.size();
+  }
+  inner_offsets.reserve(total_pairs + 1);
 
   inner_offsets.push_back(0);
   outer_offsets.push_back(0);
@@ -531,7 +539,7 @@ std::unique_ptr<cudf::column> make_expected_raw_map_array(std::vector<std::vecto
         inner_valid.push_back(arr.has_value());
         if (arr.has_value()) {
           for (auto const& elem : *arr) {
-            flat_elements.push_back(elem.value_or(std::string{}));
+            flat_elements.push_back(elem.value_or(""));
             flat_element_valid.push_back(elem.has_value());
             ++elem_running;
           }

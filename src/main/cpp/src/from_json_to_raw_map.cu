@@ -399,43 +399,46 @@ rmm::device_uvector<NodeIndexT> compute_parent_node_ids(
   return parent_node_ids;
 }
 
-// Special values to denote if a node is a key or value to extract for the output.
-constexpr int8_t key_sentinel{1};
-constexpr int8_t value_sentinel{2};
-// Sentinel marking a node that is a direct element of a value array. Distinct from the key/value
-// sentinels so the reused `extract_keys_or_values` can select elements.
-constexpr int8_t element_sentinel{3};
+// Node classification for the key/value/element extraction passes; stored in device arrays and the
+// element flag, int8_t-backed to keep the arrays compact. `extract_keys_or_values` selects the
+// nodes of a given kind (key, value, or a direct element of a value array).
+enum class node_kind : int8_t { none = 0, key = 1, value = 2, element = 3 };
 
-// Per-token list-nesting weight for the nested-range balance scan. libcudf bounds JSON tree depth
-// to 127 (`TreeDepthT` is `int8_t`), so a weight of 256 keeps list nesting (+/-256) from colliding
-// with struct nesting (+/-1) when a running delta sum locates a nested node's matching close.
+// Predicates over `node_kind` so the classification passes read as intent, not magic comparisons.
+__device__ inline bool is_key_node(node_kind const k) { return k == node_kind::key; }
+__device__ inline bool is_value_node(node_kind const k) { return k == node_kind::value; }
+__device__ inline bool is_element_node(node_kind const k) { return k == node_kind::element; }
+
+// Per-token nesting weights for the nested-range balance scan. libcudf bounds JSON tree depth to
+// 127
+// (`TreeDepthT` is `int8_t`), so the list weight (256) keeps list nesting (+/-256) from colliding
+// with struct nesting (+/-struct_nesting_weight) when a running delta sum locates a matching close.
+constexpr int32_t struct_nesting_weight{1};
 constexpr int32_t list_nesting_weight{1 << 8};
 
 // Check for each node if it is a key or a value field.
-rmm::device_uvector<int8_t> check_key_or_value_nodes(
+rmm::device_uvector<node_kind> check_key_or_value_nodes(
   cudf::device_span<NodeIndexT const> parent_node_ids, rmm::cuda_stream_view stream)
 {
-  auto key_or_value       = rmm::device_uvector<int8_t>(parent_node_ids.size(), stream);
+  auto key_or_value       = rmm::device_uvector<node_kind>(parent_node_ids.size(), stream);
   auto const transform_it = thrust::counting_iterator<int>(0);
   thrust::transform(
     rmm::exec_policy_nosync(stream),
     transform_it,
     transform_it + parent_node_ids.size(),
     key_or_value.begin(),
-    cuda::proclaim_return_type<int8_t>(
-      [key_sentinel   = key_sentinel,
-       value_sentinel = value_sentinel,
-       parent_ids     = parent_node_ids.begin()] __device__(auto const node_id) -> int8_t {
+    cuda::proclaim_return_type<node_kind>(
+      [parent_ids = parent_node_ids.begin()] __device__(auto const node_id) -> node_kind {
         if (parent_ids[node_id] >= 0) {
           auto const grand_parent = parent_ids[parent_ids[node_id]];
           if (grand_parent < 0) {
-            return key_sentinel;
+            return node_kind::key;
           } else if (parent_ids[grand_parent] < 0) {
-            return value_sentinel;
+            return node_kind::value;
           }
         }
 
-        return 0;
+        return node_kind::none;
       }));
 
 #ifdef DEBUG_FROM_JSON
@@ -459,7 +462,7 @@ struct tokenized_input {
   cudf::size_type num_nodes;
   rmm::device_uvector<NodeIndexT> node_token_ids;
   rmm::device_uvector<NodeIndexT> parent_node_ids;
-  rmm::device_uvector<int8_t> is_key_or_value_node;
+  rmm::device_uvector<node_kind> is_key_or_value_node;
 };
 
 // Run the shared prelude: concatenate + optionally normalize the input, tokenize it, then build
@@ -545,14 +548,14 @@ __device__ inline token_t end_of_partner(PdaTokenT const tk)
   };
 }
 
-// Per-token nesting-depth delta (struct +/-1, list +/-list_nesting_weight) so a running sum hits 0
-// at a nested node's matching close; the distinct magnitudes stop a struct close balancing a list
-// open.
+// Per-token nesting-depth delta (struct +/-struct_nesting_weight, list +/-list_nesting_weight) so a
+// running sum hits 0 at a nested node's matching close; the distinct magnitudes stop a struct close
+// balancing a list open.
 __device__ inline int32_t nested_node_to_value(PdaTokenT const tk)
 {
   switch (tk) {
-    case token_t::StructBegin: return 1;
-    case token_t::StructEnd: return -1;
+    case token_t::StructBegin: return struct_nesting_weight;
+    case token_t::StructEnd: return -struct_nesting_weight;
     case token_t::ListBegin: return list_nesting_weight;
     case token_t::ListEnd: return -list_nesting_weight;
     default: return 0;
@@ -567,15 +570,57 @@ __device__ inline NodeIndexT matching_close_index(cudf::device_span<PdaTokenT co
                                                   NodeIndexT const token_idx)
 {
   auto nested_range_value = nested_node_to_value(tokens[token_idx]);
-  auto end_idx            = token_idx + 1;
-  while (end_idx < tokens.size()) {
+  for (auto end_idx = token_idx + 1; end_idx < tokens.size(); ++end_idx) {
     nested_range_value += nested_node_to_value(tokens[end_idx]);
-    if (nested_range_value == 0) { break; }
-    ++end_idx;
+    if (nested_range_value == 0) {
+      cudf_assert((end_idx + 1 < tokens.size()) && "Nested close must be followed by more tokens.");
+      return end_idx;
+    }
   }
-  cudf_assert(nested_range_value == 0 && "Nested range never closed (unbalanced tokens).");
-  cudf_assert((end_idx + 1 < tokens.size()) && "Nested close must be followed by more tokens.");
-  return end_idx;
+  cudf_assert(false && "Nested range never closed (unbalanced tokens).");
+  return static_cast<NodeIndexT>(tokens.size());
+}
+
+// De-quote a token's start position; shared by node_ranges_fn and element_classify_fn so the two
+// paths can't drift apart. With include_quote_char == false, StringEnd matches default (return
+// pos); with include_quote_char == true it keeps the trailing quote, which default would not.
+__device__ inline SymbolOffsetT dequote_token_position(PdaTokenT const token,
+                                                       SymbolOffsetT const token_index,
+                                                       bool const include_quote_char)
+{
+  constexpr SymbolOffsetT quote_char_size = 1;
+  switch (token) {
+    case token_t::StringBegin: return token_index + (include_quote_char ? 0 : quote_char_size);
+    case token_t::StringEnd: return token_index + (include_quote_char ? quote_char_size : 0);
+    case token_t::FieldNameBegin: return token_index + quote_char_size;
+    default: return token_index;
+  };
+}
+
+// Byte range [begin, end) for the node at `token_idx`: the de-quoted begin, and the end taken from
+// the adjacent partner close, or the matching close for a nested ([/{) node. Shared by both
+// functors.
+__device__ inline cuda::std::pair<SymbolOffsetT, SymbolOffsetT> compute_token_range(
+  cudf::device_span<PdaTokenT const> tokens,
+  cudf::device_span<SymbolOffsetT const> token_positions,
+  NodeIndexT const token_idx,
+  bool const include_quote_char)
+{
+  auto const token = tokens[token_idx];
+  auto const range_begin =
+    dequote_token_position(token, token_positions[token_idx], include_quote_char);
+  auto range_end = range_begin + 1;
+  if ((token_idx + 1) < tokens.size() && end_of_partner(token) == tokens[token_idx + 1]) {
+    range_end = dequote_token_position(
+      tokens[token_idx + 1], token_positions[token_idx + 1], include_quote_char);
+  } else {
+    auto const end_idx = matching_close_index(tokens, token_idx);
+    if (end_idx < tokens.size()) {
+      range_end =
+        dequote_token_position(tokens[end_idx], token_positions[end_idx], include_quote_char) + 1;
+    }
+  }
+  return {range_begin, range_end};
 }
 
 // Convert token positions to node ranges for each valid node.
@@ -584,7 +629,7 @@ struct node_ranges_fn {
   cudf::device_span<SymbolOffsetT const> token_positions;
   cudf::device_span<NodeIndexT const> node_token_ids;
   cudf::device_span<NodeIndexT const> parent_node_ids;
-  cudf::device_span<int8_t const> key_or_value;
+  cudf::device_span<node_kind const> key_or_value;
 
   // Whether the extracted string values from json map will have the quote character.
   static const bool include_quote_char{false};
@@ -603,43 +648,14 @@ struct node_ranges_fn {
         };
       });
 
-    auto const get_token_position = cuda::proclaim_return_type<SymbolOffsetT>(
-      [include_quote_char = include_quote_char] __device__(PdaTokenT const token,
-                                                           SymbolOffsetT const token_index) {
-        constexpr SymbolOffsetT quote_char_size = 1;
-        switch (token) {
-          // Strip off quote char included for StringBegin
-          case token_t::StringBegin:
-            return token_index + (include_quote_char ? 0 : quote_char_size);
-          // Strip off or Include trailing quote char for string values for StringEnd
-          case token_t::StringEnd: return token_index + (include_quote_char ? quote_char_size : 0);
-          // Strip off quote char included for FieldNameBegin
-          case token_t::FieldNameBegin: return token_index + quote_char_size;
-          default: return token_index;
-        };
-      });
-
-    if (key_or_value[node_id] != key_sentinel && key_or_value[node_id] != value_sentinel) {
+    if (!is_key_node(key_or_value[node_id]) && !is_value_node(key_or_value[node_id])) {
       return {0, 0};
     }
 
     auto const token_idx = node_token_ids[node_id];
-    auto const token     = tokens[token_idx];
-    cudf_assert(is_begin_of_section(token) && "Invalid node category.");
+    cudf_assert(is_begin_of_section(tokens[token_idx]) && "Invalid node category.");
 
-    // The section from the original JSON input that this token demarcates.
-    auto const range_begin = get_token_position(token, token_positions[token_idx]);
-    auto range_end         = range_begin + 1;  // non-leaf, non-field nodes ignore this value.
-    if ((token_idx + 1) < tokens.size() && end_of_partner(token) == tokens[token_idx + 1]) {
-      // Update the range_end for this pair of tokens
-      range_end = get_token_position(tokens[token_idx + 1], token_positions[token_idx + 1]);
-    } else {
-      auto const end_idx = matching_close_index(tokens, token_idx);
-      if (end_idx < tokens.size()) {
-        range_end = get_token_position(tokens[end_idx], token_positions[end_idx]) + 1;
-      }
-    }
-    return {range_begin, range_end};
+    return compute_token_range(tokens, token_positions, token_idx, include_quote_char);
   }
 };
 
@@ -650,7 +666,7 @@ rmm::device_uvector<cuda::std::pair<SymbolOffsetT, SymbolOffsetT>> compute_node_
   cudf::device_span<SymbolOffsetT const> token_positions,
   cudf::device_span<NodeIndexT const> node_token_ids,
   cudf::device_span<NodeIndexT const> parent_node_ids,
-  cudf::device_span<int8_t const> key_or_value,
+  cudf::device_span<node_kind const> key_or_value,
   rmm::cuda_stream_view stream)
 {
   auto const num_nodes = node_token_ids.size();
@@ -695,9 +711,9 @@ struct substring_fn {
 
 // Extract key-value string pairs from the input json string.
 std::unique_ptr<cudf::column> extract_keys_or_values(
-  int8_t key_value_sentinel,
+  node_kind key_value_sentinel,
   cudf::device_span<cuda::std::pair<SymbolOffsetT, SymbolOffsetT> const> node_ranges,
-  cudf::device_span<int8_t const> key_or_value,
+  cudf::device_span<node_kind const> key_or_value,
   cudf::device_span<char const> input_json,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
@@ -728,7 +744,7 @@ std::unique_ptr<cudf::column> extract_keys_or_values(
 std::unique_ptr<cudf::column> compute_list_offsets(
   cudf::size_type n_lists,
   cudf::device_span<NodeIndexT const> parent_node_ids,
-  cudf::device_span<int8_t const> key_or_value,
+  cudf::device_span<node_kind const> key_or_value,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr)
 {
@@ -749,7 +765,7 @@ std::unique_ptr<cudf::column> compute_list_offsets(
 
   auto const is_key = cuda::proclaim_return_type<bool>(
     [key_or_value = key_or_value.begin()] __device__(auto const node_id) {
-      return key_or_value[node_id] == key_sentinel;
+      return is_key_node(key_or_value[node_id]);
     });
 
   // Count the number of keys for each json object using `atomicAdd`.
@@ -937,38 +953,24 @@ std::unique_ptr<cudf::column> make_empty_map_array(rmm::cuda_stream_view stream,
 // Classify each node as a value-array element and, if so, compute its de-quoted byte range and
 // element validity (mask #2: null iff it is the literal `null`). Emitted as three parallel device
 // vectors in one fused pass so the element extraction, inner offsets, and masks need no extra
-// classification pass. The de-quote logic mirrors `node_ranges_fn`/`get_token_position` for the
-// `Map[String,String]` path so element strings match the existing value semantics.
+// classification pass. The de-quote/range logic is shared with `node_ranges_fn` via
+// `dequote_token_position`/`compute_token_range` so element strings match the value semantics.
 struct element_classify_fn {
   cudf::device_span<char const> input_json;
   cudf::device_span<PdaTokenT const> tokens;
   cudf::device_span<SymbolOffsetT const> token_positions;
   cudf::device_span<NodeIndexT const> node_token_ids;
   cudf::device_span<NodeIndexT const> parent_node_ids;
-  cudf::device_span<int8_t const> key_or_value;
+  cudf::device_span<node_kind const> key_or_value;
 
   // Outputs.
-  int8_t* element_flag;
+  node_kind* element_flag;
   cuda::std::pair<SymbolOffsetT, SymbolOffsetT>* element_ranges;
   bool* element_valid;
 
-  // Element byte range drops the surrounding quotes: the opening quote is skipped (StringBegin
-  // advances one byte) and the closing quote is excluded by ending at the unadvanced StringEnd
-  // position. Literals/values keep their position verbatim.
-  static __device__ SymbolOffsetT get_token_position(PdaTokenT const tk, SymbolOffsetT const pos)
-  {
-    constexpr SymbolOffsetT quote_char_size = 1;
-    switch (tk) {
-      case token_t::StringBegin: return pos + quote_char_size;
-      case token_t::StringEnd: return pos;
-      case token_t::FieldNameBegin: return pos + quote_char_size;
-      default: return pos;
-    };
-  }
-
   __device__ void operator()(cudf::size_type node_id) const
   {
-    element_flag[node_id]   = 0;
+    element_flag[node_id]   = node_kind::none;
     element_ranges[node_id] = {0, 0};
     element_valid[node_id]  = true;
 
@@ -978,27 +980,18 @@ struct element_classify_fn {
     // Exclude error nodes; they are not array elements.
     if (token == token_t::ErrorBegin) { return; }
 
-    // An element is a node whose parent is the value array's `ListBegin`. The value-sentinel guard
-    // is required: a nested inner `[` is also a `ListBegin`, but its parent is not value-tagged.
+    // An element is a node whose parent is the value array's `ListBegin`. The value guard is
+    // required: a nested inner `[` is also a `ListBegin`, but its parent is not value-tagged.
     auto const parent = parent_node_ids[node_id];
-    if (parent < 0 || key_or_value[parent] != value_sentinel ||
+    if (parent < 0 || !is_value_node(key_or_value[parent]) ||
         tokens[node_token_ids[parent]] != token_t::ListBegin) {
       return;
     }
 
-    auto const range_begin = get_token_position(token, token_positions[token_idx]);
-    auto range_end         = range_begin + 1;
-    if ((token_idx + 1) < tokens.size() && end_of_partner(token) == tokens[token_idx + 1]) {
-      range_end = get_token_position(tokens[token_idx + 1], token_positions[token_idx + 1]);
-    } else {
-      // Nested element (`[`/`{`): its end token isn't adjacent, so span to the matching close.
-      auto const end_idx = matching_close_index(tokens, token_idx);
-      if (end_idx < tokens.size()) {
-        range_end = get_token_position(tokens[end_idx], token_positions[end_idx]) + 1;
-      }
-    }
+    auto const [range_begin, range_end] =
+      compute_token_range(tokens, token_positions, token_idx, /*include_quote_char=*/false);
 
-    element_flag[node_id]   = element_sentinel;
+    element_flag[node_id]   = node_kind::element;
     element_ranges[node_id] = {range_begin, range_end};
 
     // Mask #2: a literal `null` element is a null element, and gets an empty byte span -- it
@@ -1041,9 +1034,9 @@ std::unique_ptr<cudf::column> from_json_to_raw_map(cudf::strings_column_view con
     tokens, token_positions, node_token_ids, parent_node_ids, is_key_or_value_node, stream);
 
   auto extracted_keys = extract_keys_or_values(
-    key_sentinel, node_ranges, is_key_or_value_node, preprocessed_input, stream, mr);
+    node_kind::key, node_ranges, is_key_or_value_node, preprocessed_input, stream, mr);
   auto extracted_values = extract_keys_or_values(
-    value_sentinel, node_ranges, is_key_or_value_node, preprocessed_input, stream, mr);
+    node_kind::value, node_ranges, is_key_or_value_node, preprocessed_input, stream, mr);
   CUDF_EXPECTS(extracted_keys->size() == extracted_values->size(),
                "Invalid key-value pair extraction.");
 
@@ -1113,11 +1106,11 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
   auto const node_ranges = compute_node_ranges(
     tokens, token_positions, node_token_ids, parent_node_ids, is_key_or_value_node, stream);
   auto extracted_keys = extract_keys_or_values(
-    key_sentinel, node_ranges, is_key_or_value_node, preprocessed_input, stream, mr);
+    node_kind::key, node_ranges, is_key_or_value_node, preprocessed_input, stream, mr);
 
   // Fused classification pass: per node emit the element flag, the de-quoted element byte range,
   // and element validity (mask #2) in one transform.
-  auto element_flag = rmm::device_uvector<int8_t>(num_nodes, stream);
+  auto element_flag = rmm::device_uvector<node_kind>(num_nodes, stream);
   auto element_ranges =
     rmm::device_uvector<cuda::std::pair<SymbolOffsetT, SymbolOffsetT>>(num_nodes, stream);
   auto element_valid = rmm::device_uvector<bool>(num_nodes, stream);
@@ -1139,14 +1132,14 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
 
   // Extract element strings with the shared extractor (a 0-null STRING column); attach mask #2.
   auto extracted_elements = extract_keys_or_values(
-    element_sentinel, element_ranges, element_flag, preprocessed_input, stream, mr);
+    node_kind::element, element_ranges, element_flag, preprocessed_input, stream, mr);
   {
     // Mask #2 over only the selected (element-flagged) nodes, in element document order, matching
     // the order `extract_keys_or_values` emits.
     auto element_validity = rmm::device_uvector<bool>(extracted_elements->size(), stream);
     auto const is_element = cuda::proclaim_return_type<bool>(
       [element_flag = element_flag.begin()] __device__(auto const node_id) {
-        return element_flag[node_id] == element_sentinel;
+        return is_element_node(element_flag[node_id]);
       });
     auto const valid_end    = copy_if(element_valid.begin(),
                                    element_valid.end(),
@@ -1181,7 +1174,7 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
                      is_key_or_value_node.begin(),
                      is_key_or_value_node.end(),
                      cuda::proclaim_return_type<bool>(
-                       [] __device__(int8_t const kv) { return kv == value_sentinel; })));
+                       [] __device__(node_kind const kv) { return is_value_node(kv); })));
   CUDF_EXPECTS(num_value_nodes == num_values,
                "Invalid key-value pair extraction for map of arrays.");
 #endif
@@ -1194,8 +1187,8 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
     auto const value_flag_it =
       thrust::make_transform_iterator(is_key_or_value_node.begin(),
                                       cuda::proclaim_return_type<cudf::size_type>(
-                                        [] __device__(int8_t const kv) -> cudf::size_type {
-                                          return kv == value_sentinel ? 1 : 0;
+                                        [] __device__(node_kind const kv) -> cudf::size_type {
+                                          return is_value_node(kv) ? 1 : 0;
                                         }));
     thrust::exclusive_scan(rmm::exec_policy_nosync(stream),
                            value_flag_it,
@@ -1218,7 +1211,7 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
                       parent_ids     = parent_node_ids.begin(),
                       value_ordinals = value_ordinals.begin(),
                       counts         = inner_offsets.begin()] __device__(auto const node_id) {
-                       if (element_flag[node_id] != element_sentinel) { return; }
+                       if (!is_element_node(element_flag[node_id])) { return; }
                        // The element's parent is the value array's `ListBegin` node.
                        auto const value_node = parent_ids[node_id];
                        auto ref = cuda::atomic_ref<cudf::size_type, cuda::thread_scope_device>{
@@ -1244,7 +1237,7 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
                       node_token_ids = node_token_ids.begin(),
                       value_ordinals = value_ordinals.begin(),
                       inner_valid    = inner_valid.begin()] __device__(auto const node_id) {
-                       if (key_or_value[node_id] != value_sentinel) { return; }
+                       if (!is_value_node(key_or_value[node_id])) { return; }
                        inner_valid[value_ordinals[node_id]] =
                          tokens[node_token_ids[node_id]] == token_t::ListBegin;
                      });
@@ -1315,7 +1308,7 @@ std::unique_ptr<cudf::column> from_json_to_raw_map_array_values(
        num_rows           = input.size(),
        should_be_nullified =
          should_be_nullified->mutable_view().begin<bool>()] __device__(NodeIndexT const node_id) {
-        if (key_or_value[node_id] != value_sentinel) { return; }
+        if (!is_value_node(key_or_value[node_id])) { return; }
         auto const token = tokens[node_token_ids[node_id]];
         if (token == token_t::ListBegin) { return; }  // valid array.
         // Keep the row for a JSON `null` literal value (its inner list becomes null). A JSON STRING

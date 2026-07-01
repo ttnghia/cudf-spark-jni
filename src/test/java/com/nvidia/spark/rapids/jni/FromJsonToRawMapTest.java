@@ -45,10 +45,9 @@ public class FromJsonToRawMapTest {
   // struct and its key child are non-nullable (the kernel builds them with no null mask); only the
   // value list (null inner list) and its elements (null element) carry nulls.
   private static final HostColumnVector.StructType STRUCT_TYPE =
-      new HostColumnVector.StructType(false,
-          new HostColumnVector.BasicType(false, DType.STRING),                             // key
-          new HostColumnVector.ListType(true, new HostColumnVector.BasicType(true,
-              DType.STRING)));                                                             // value
+      new HostColumnVector.StructType(false,  // key + value
+          new HostColumnVector.BasicType(false, DType.STRING),
+          new HostColumnVector.ListType(true, new HostColumnVector.BasicType(true, DType.STRING)));
   private static final HostColumnVector.ListType LIST_TYPE =
       new HostColumnVector.ListType(true, STRUCT_TYPE);
 
