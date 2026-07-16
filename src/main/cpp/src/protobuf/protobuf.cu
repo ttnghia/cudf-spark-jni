@@ -392,16 +392,6 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
   auto const num_rows   = binary_input.size();
   auto const num_fields = static_cast<int>(schema.size());
 
-  if (num_fields == 0) {
-    auto const input_null_count = binary_input.null_count();
-    if (input_null_count > 0) {
-      auto null_mask = cudf::copy_bitmask(binary_input, stream, mr);
-      return cudf::make_structs_column(
-        num_rows, {}, input_null_count, std::move(null_mask), stream, mr);
-    }
-    return cudf::make_structs_column(num_rows, {}, 0, rmm::device_buffer{}, stream, mr);
-  }
-
   if (num_rows == 0) {
     std::vector<std::unique_ptr<cudf::column>> empty_children;
     for (int i = 0; i < num_fields; i++) {
@@ -470,9 +460,12 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
     }
   }
 
-  int const num_repeated = static_cast<int>(repeated_field_indices.size());
-  int const num_nested   = static_cast<int>(nested_field_indices.size());
-  int const num_scalar   = static_cast<int>(scalar_field_indices.size());
+  int const num_repeated    = static_cast<int>(repeated_field_indices.size());
+  int const num_nested      = static_cast<int>(nested_field_indices.size());
+  int const num_scalar      = static_cast<int>(scalar_field_indices.size());
+  bool const run_count_scan = num_repeated > 0 || num_nested > 0;
+  // Validate empty schemas through the field scan without rescanning repeated-only schemas.
+  bool const run_field_scan = num_scalar > 0 || !run_count_scan;
 
   auto d_error = cudf::detail::make_zeroed_device_uvector_async<protobuf_error>(
     1, stream, cudf::get_current_device_resource_ref());
@@ -516,7 +509,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
   rmm::device_uvector<int> d_fn_to_rep(0, stream, scratch_mr);
   rmm::device_uvector<int> d_fn_to_nested(0, stream, scratch_mr);
 
-  if (num_repeated > 0 || num_nested > 0) {
+  if (run_count_scan) {
     auto h_fn_to_rep =
       build_index_lookup_table(schema.data(), repeated_field_indices.data(), num_repeated, stream);
     auto h_fn_to_nested =
@@ -544,6 +537,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
                                  num_nested,
                                  d_nested_indices.data(),
                                  d_error.data(),
+                                 track_permissive_null_rows ? d_row_force_null.data() : nullptr,
                                  d_fn_to_rep.data(),
                                  static_cast<int>(d_fn_to_rep.size()),
                                  d_fn_to_nested.data(),
@@ -556,7 +550,7 @@ std::unique_ptr<cudf::column> decode_protobuf_to_struct(cudf::column_view const&
   std::vector<std::unique_ptr<cudf::column>> column_map(num_fields);
 
   // Process scalar fields using scan + extract infrastructure
-  if (num_scalar > 0) {
+  if (run_field_scan) {
     auto h_field_descs =
       cudf::detail::make_pinned_vector_async<field_descriptor>(num_scalar, stream);
     for (int i = 0; i < num_scalar; i++) {
