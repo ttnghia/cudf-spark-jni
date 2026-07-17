@@ -70,11 +70,22 @@ constexpr auto MAX_BATCH_SIZE = std::numeric_limits<cudf::size_type>::max();
 
 constexpr auto BLOCK_SIZE = 1024;
 
-// Number of rows each block processes in the two kernels. Tuned via nsight
-constexpr auto NUM_STRING_ROWS_PER_BLOCK_TO_ROWS   = BLOCK_SIZE;
-constexpr auto NUM_STRING_ROWS_PER_BLOCK_FROM_ROWS = 64;
-constexpr auto MIN_STRING_BLOCKS                   = 32;
-constexpr auto MAX_STRING_BLOCKS                   = MAX_BATCH_SIZE;
+// Number of rows each block processes in the string to-rows kernel. Tuned via nsight
+constexpr auto NUM_STRING_ROWS_PER_BLOCK_TO_ROWS = BLOCK_SIZE;
+constexpr auto MAX_STRING_BLOCKS                 = MAX_BATCH_SIZE;
+
+// From-rows string copy engine geometry: four warps per block, matching cudf's strings-gather
+constexpr auto STRING_COPY_WARPS_PER_BLOCK = 4;
+constexpr auto STRING_COPY_BLOCK_SIZE      = STRING_COPY_WARPS_PER_BLOCK * 32;
+
+// Grid x-dimension cap of the warp-per-string from-rows kernel; its warps grid-stride over rows
+constexpr auto MAX_STRING_COPY_BLOCKS = 65536;
+
+// Mean string length above which the from-rows string copy picks the warp-per-string kernel
+constexpr auto STRING_COPY_AVG_LEN_SWITCH = 32;
+
+// Strings staged per block by the char-parallel from-rows kernel
+constexpr auto STRING_COPY_STRINGS_PER_BLOCK = 32;
 
 }  // anonymous namespace
 
@@ -1244,67 +1255,181 @@ __launch_bounds__(block_size) CUDF_KERNEL
   shared_tile_barrier.arrive_and_wait();
 }
 
+// Load 16B from a potentially unaligned address via aligned 4B words funnel-shifted into place.
+// Reads bytes in [ptr - 3, ptr + 20), so callers must keep that window inside the source buffer.
+__forceinline__ __device__ uint4 load_uint4(char const* ptr)
+{
+  auto const offset       = reinterpret_cast<std::uintptr_t>(ptr) % 4;
+  auto const* aligned_ptr = reinterpret_cast<unsigned int const*>(ptr - offset);
+  auto const shift        = offset * 8;
+
+  uint4 regs = {aligned_ptr[0], aligned_ptr[1], aligned_ptr[2], aligned_ptr[3]};
+  uint tail  = 0;
+  if (shift) { tail = aligned_ptr[4]; }
+
+  regs.x = __funnelshift_r(regs.x, regs.y, shift);
+  regs.y = __funnelshift_r(regs.y, regs.z, shift);
+  regs.z = __funnelshift_r(regs.z, regs.w, shift);
+  regs.w = __funnelshift_r(regs.w, tail, shift);
+
+  return regs;
+}
+
 /**
- * @brief copies string data from jcudf row format to cudf columns
+ * @brief copies string data from jcudf row format to cudf columns, one output byte per thread
  *
- * @tparam block_size number of threads in a block.
+ * Port of cudf's strings-gather char-parallel kernel: each block stages the offsets window and the
+ * source address of each of its strings in shared memory, then threads write consecutive output
+ * bytes, binary-searching the window for the owning string. Suited to short strings, where dense
+ * byte stores beat one-warp-per-string copies. Columns map to blockIdx.y.
+ *
+ * @tparam strings_per_block number of strings each block copies
  * @tparam RowOffsetFunctor iterator for row offsets into the destination data
  * @param row_offsets offsets for each row in input data
  * @param string_row_offsets offset data into jcudf row data for each string
- * @param string_lengths length of each incoming string in each column
  * @param string_column_offsets offset column data for cudf column
  * @param string_col_data output cudf string column data
  * @param row_data jcudf row data
  * @param num_rows number of rows in data
  * @param num_string_columns number of string columns in the table
  */
-template <int block_size, typename RowOffsetFunctor>
-__launch_bounds__(block_size) CUDF_KERNEL
-  void copy_strings_from_rows(RowOffsetFunctor row_offsets,
-                              int32_t** string_row_offsets,
-                              int32_t** string_lengths,
-                              size_type** string_column_offsets,
-                              char** string_col_data,
-                              int8_t const* row_data,
-                              size_type const num_rows,
-                              size_type const num_string_columns)
+template <int strings_per_block, typename RowOffsetFunctor>
+__launch_bounds__(STRING_COPY_BLOCK_SIZE) CUDF_KERNEL
+  void copy_strings_from_rows_char_parallel(RowOffsetFunctor row_offsets,
+                                            int32_t** string_row_offsets,
+                                            size_type** string_column_offsets,
+                                            char** string_col_data,
+                                            int8_t const* row_data,
+                                            size_type const num_rows,
+                                            size_type const num_string_columns)
 {
-  // Each warp takes a tile, which is a single column and up to ROWS_PER_BLOCK rows. A tile will not
-  // wrap around the bottom of the table. The warp will copy the strings for each row in the tile.
-  // Traversing in row-major order to coalesce the offsets and size reads.
-  auto my_block = cooperative_groups::this_thread_block();
-  auto warp     = cooperative_groups::tiled_partition<cudf::detail::warp_size>(my_block);
+  // Offsets window plus per-string source addresses, staged so the per-byte loop does one
+  // shared-memory lookup per side instead of three dependent global loads.
+  __shared__ size_type block_offsets[strings_per_block + 1];
+  __shared__ char const* block_src[strings_per_block];
 
-  // The barrier must be __shared__, initialized, and waited on; see the matching comment in
-  // copy_strings_to_rows.
-  __shared__ cuda::barrier<cuda::thread_scope_block> block_barrier;
-  if (my_block.thread_rank() == 0) { init(&block_barrier, my_block.size()); }
-  my_block.sync();
+  auto const begin_row         = static_cast<size_type>(blockIdx.x) * strings_per_block;
+  auto const num_block_strings = cuda::std::min(strings_per_block, num_rows - begin_row);
+  if (num_block_strings <= 0) { return; }
 
-  // workaround for not being able to take a reference to a constexpr host variable
-  auto const ROWS_PER_BLOCK = NUM_STRING_ROWS_PER_BLOCK_FROM_ROWS;
-  auto const tiles_per_col  = cudf::util::div_rounding_up_unsafe(num_rows, ROWS_PER_BLOCK);
-  auto const starting_tile  = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-  auto const num_tiles      = tiles_per_col * num_string_columns;
-  auto const tile_stride    = warp.meta_group_size() * gridDim.x;
-  // Each warp will copy strings in its tile. This is handled by all the threads of a warp passing
-  // the same parameters to async_memcpy and all threads in the warp participating in the copy.
-  for (auto my_tile = starting_tile; my_tile < num_tiles; my_tile += tile_stride) {
-    auto const starting_row = (my_tile % tiles_per_col) * ROWS_PER_BLOCK;
-    auto const col          = my_tile / tiles_per_col;
-    auto const str_len      = string_lengths[col];
-    auto const str_row_off  = string_row_offsets[col];
-    auto const str_col_off  = string_column_offsets[col];
-    auto str_col_data       = string_col_data[col];
-    for (int row = starting_row; row < starting_row + ROWS_PER_BLOCK && row < num_rows; ++row) {
-      auto const src = &row_data[row_offsets(row, 0) + str_row_off[row]];
-      auto dst       = &str_col_data[str_col_off[row]];
+  for (auto col = blockIdx.y; col < static_cast<uint32_t>(num_string_columns); col += gridDim.y) {
+    auto const str_col_off = string_column_offsets[col];
+    auto const str_row_off = string_row_offsets[col];
+    for (size_type idx = threadIdx.x; idx <= num_block_strings; idx += blockDim.x) {
+      auto const row     = begin_row + idx;
+      block_offsets[idx] = str_col_off[row];
+      if (idx < num_block_strings) {
+        block_src[idx] =
+          reinterpret_cast<char const*>(row_data) + row_offsets(row, 0) + str_row_off[row];
+      }
+    }
+    __syncthreads();
 
-      cuda::memcpy_async(warp, dst, src, str_len[row], block_barrier);
+    auto const out_chars = string_col_data[col];
+    for (int64_t out_ibyte = static_cast<int64_t>(block_offsets[0]) + threadIdx.x;
+         out_ibyte < block_offsets[num_block_strings];
+         out_ibyte += blockDim.x) {
+      // Find the string owning this output byte in the staged window
+      auto const string_idx = static_cast<size_type>(cuda::std::distance(
+        block_offsets,
+        cuda::std::prev(thrust::upper_bound(thrust::seq,
+                                            block_offsets,
+                                            block_offsets + num_block_strings,
+                                            static_cast<size_type>(out_ibyte)))));
+      out_chars[out_ibyte]  = block_src[string_idx][out_ibyte - block_offsets[string_idx]];
+    }
+
+    // The shared window is reused per column iteration; the condition is block-uniform
+    if (col + gridDim.y < static_cast<uint32_t>(num_string_columns)) { __syncthreads(); }
+  }
+}
+
+/**
+ * @brief copies string data from jcudf row format to cudf columns, one warp per string
+ *
+ * Port of cudf's strings-gather string-parallel kernel: a warp cooperatively stores its string
+ * through 16B-aligned uint4 writes, funnel-shifting unaligned source words into place, with
+ * bytewise head/tail fixups. Suited to long strings. Columns map to blockIdx.y; warps grid-stride
+ * over the rows of a column.
+ *
+ * @tparam RowOffsetFunctor iterator for row offsets into the destination data
+ * @param row_offsets offsets for each row in input data
+ * @param string_row_offsets offset data into jcudf row data for each string
+ * @param string_column_offsets offset column data for cudf column
+ * @param string_col_data output cudf string column data
+ * @param row_data jcudf row data
+ * @param num_rows number of rows in data
+ * @param num_string_columns number of string columns in the table
+ */
+template <typename RowOffsetFunctor>
+__launch_bounds__(STRING_COPY_BLOCK_SIZE) CUDF_KERNEL
+  void copy_strings_from_rows_string_parallel(RowOffsetFunctor row_offsets,
+                                              int32_t** string_row_offsets,
+                                              size_type** string_column_offsets,
+                                              char** string_col_data,
+                                              int8_t const* row_data,
+                                              size_type const num_rows,
+                                              size_type const num_string_columns)
+{
+  constexpr int64_t warp_size         = 32;
+  constexpr int64_t out_datatype_size = sizeof(uint4);
+  constexpr int64_t in_datatype_size  = sizeof(uint);
+
+  auto const global_thread_id = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  auto const global_warp_id   = global_thread_id / warp_size;
+  auto const warp_lane        = global_thread_id % warp_size;
+  auto const nwarps           = static_cast<int64_t>(gridDim.x) * blockDim.x / warp_size;
+
+  for (auto col = blockIdx.y; col < static_cast<uint32_t>(num_string_columns); col += gridDim.y) {
+    auto const str_row_off = string_row_offsets[col];
+    auto const str_col_off = string_column_offsets[col];
+    auto const out_chars   = string_col_data[col];
+
+    auto const alignment_offset =
+      static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(out_chars) % out_datatype_size);
+    uint4* const out_chars_aligned = reinterpret_cast<uint4*>(out_chars - alignment_offset);
+
+    for (auto row = global_warp_id; row < num_rows; row += nwarps) {
+      int64_t const out_start = str_col_off[row];
+      int64_t const out_end   = str_col_off[row + 1];
+      // Null and empty strings carry zero length: nothing to copy
+      if (out_start == out_end) { continue; }
+
+      char const* const in_start = reinterpret_cast<char const*>(row_data) +
+                                   row_offsets(static_cast<size_type>(row), 0) + str_row_off[row];
+
+      // 16B-aligned store range, shrunk by one 4B word on each side so load_uint4's word reads
+      // never leave the string.
+      int64_t const out_start_aligned =
+        (out_start + in_datatype_size + alignment_offset + out_datatype_size - 1) /
+          out_datatype_size * out_datatype_size -
+        alignment_offset;
+      int64_t const out_end_aligned =
+        (out_end - in_datatype_size + alignment_offset) / out_datatype_size * out_datatype_size -
+        alignment_offset;
+
+      for (auto ichar = out_start_aligned + warp_lane * out_datatype_size; ichar < out_end_aligned;
+           ichar += warp_size * out_datatype_size) {
+        *(out_chars_aligned + (ichar + alignment_offset) / out_datatype_size) =
+          load_uint4(in_start + ichar - out_start);
+      }
+
+      if (out_end_aligned <= out_start_aligned) {
+        // No aligned slot fits: copy the whole string bytewise
+        for (auto ichar = out_start + warp_lane; ichar < out_end; ichar += warp_size) {
+          out_chars[ichar] = in_start[ichar - out_start];
+        }
+      } else {
+        // Head [out_start, out_start_aligned) and tail [out_end_aligned, out_end) are each shorter
+        // than one warp-width of bytes.
+        if (out_start + warp_lane < out_start_aligned) {
+          out_chars[out_start + warp_lane] = in_start[warp_lane];
+        }
+        auto const ichar = out_end_aligned + warp_lane;
+        if (ichar < out_end) { out_chars[ichar] = in_start[ichar - out_start]; }
+      }
     }
   }
-
-  block_barrier.arrive_and_wait();
 }
 
 /**
@@ -2613,50 +2738,131 @@ std::unique_ptr<table> convert_from_rows(lists_column_view const& input,
         child.data<int8_t>(),
         dev_valid_counts.data());
 
+    auto const num_string_columns = static_cast<size_type>(string_lengths.size());
+
+    // Allocate all offsets buffers up front so one batched scan can fill every column.
     std::vector<device_uvector<size_type>> string_col_offsets;
     std::vector<rmm::device_uvector<char>> string_data_cols;
     std::vector<size_type*> string_col_offset_ptrs;
     std::vector<char*> string_data_col_ptrs;
-    for (auto& col_string_lengths : string_lengths) {
-      device_uvector<size_type> output_string_offsets(num_rows + 1, stream, mr);
-      auto tmp = cuda::proclaim_return_type<int32_t>(
-        [num_rows, col_string_lengths] __device__(auto const& i) {
-          return i < num_rows ? col_string_lengths[i] : 0;
-        });
-      auto bounded_iter = spark_rapids_jni::util::make_counting_transform_iterator(0, tmp);
-      thrust::exclusive_scan(rmm::exec_policy(stream),
-                             bounded_iter,
-                             bounded_iter + num_rows + 1,
-                             output_string_offsets.begin());
-
-      // allocate destination string column
-      rmm::device_uvector<char> string_data(
-        output_string_offsets.element(num_rows, stream), stream, mr);
-
-      string_col_offset_ptrs.push_back(output_string_offsets.data());
-      string_data_col_ptrs.push_back(string_data.data());
-      string_col_offsets.push_back(std::move(output_string_offsets));
-      string_data_cols.push_back(std::move(string_data));
+    for (size_type i = 0; i < num_string_columns; ++i) {
+      string_col_offsets.emplace_back(num_rows + 1, stream, mr);
+      string_col_offset_ptrs.push_back(string_col_offsets.back().data());
     }
 
-    // second arena upload: these pointer arrays only exist after the per-column scans above
-    auto const [dev_string_col_offsets, dev_string_data_cols] =
-      arena.upload(string_col_offset_ptrs, string_data_col_ptrs);
+    // second arena upload, offsets pointers only: the totals gather below dereferences this
+    // array on device before the chars sizes are known
+    auto* const dev_string_col_offsets = std::get<0>(arena.upload(string_col_offset_ptrs));
 
-    dim3 const string_blocks(
-      std::min(std::max(MIN_STRING_BLOCKS, num_rows / NUM_STRING_ROWS_PER_BLOCK_FROM_ROWS),
-               MAX_STRING_BLOCKS));
+    // One exclusive scan-by-key over the K string columns flattened to K*(num_rows+1) elements
+    // replaces K per-column scans that each paid a launch plus a hard sync to read back its
+    // total. Segment = column with init 0 per segment, the exact per-column exclusive_scan
+    // result; past each column's last row the value iterator feeds 0 so the column's total chars
+    // size lands at slot [num_rows]. The flat count fits size_type: the validated row layout
+    // spends 8 fixed bytes per string column per row, capping K*num_rows below 2^28.
+    auto const flat_stride = num_rows + 1;
+    auto const flat_count  = num_string_columns * flat_stride;
+    auto flat_keys         = spark_rapids_jni::util::make_counting_transform_iterator(
+      0, cuda::proclaim_return_type<size_type>([flat_stride] __device__(auto const& i) {
+        return i / flat_stride;
+      }));
+    auto flat_lengths = spark_rapids_jni::util::make_counting_transform_iterator(
+      0,
+      cuda::proclaim_return_type<int32_t>(
+        [flat_stride, num_rows, lengths = dev_string_lengths] __device__(auto const& i) {
+          auto const row = i % flat_stride;
+          return row < num_rows ? lengths[i / flat_stride][row] : 0;
+        }));
+    {
+      // Scan into one contiguous scratch buffer and peel it into the per-column offsets with K
+      // small stream-ordered D2D copies; scoped to release the scratch before the chars
+      // allocations below.
+      rmm::device_uvector<size_type> flat_offsets(flat_count, stream);
+      thrust::exclusive_scan_by_key(rmm::exec_policy(stream),
+                                    flat_keys,
+                                    flat_keys + flat_count,
+                                    flat_lengths,
+                                    flat_offsets.begin());
+      for (size_type i = 0; i < num_string_columns; ++i) {
+        CUDF_CUDA_TRY(
+          cudaMemcpyAsync(string_col_offset_ptrs[i],
+                          flat_offsets.data() + static_cast<std::size_t>(i) * flat_stride,
+                          sizeof(size_type) * flat_stride,
+                          cudaMemcpyDeviceToDevice,
+                          stream.value()));
+      }
+    }
 
-    detail::copy_strings_from_rows<NUM_STRING_ROWS_PER_BLOCK_FROM_ROWS>
-      <<<string_blocks, NUM_STRING_ROWS_PER_BLOCK_FROM_ROWS, 0, stream.value()>>>(
-        offset_functor,
-        dev_string_row_offsets,
-        dev_string_lengths,
-        dev_string_col_offsets,
-        dev_string_data_cols,
-        child.data<int8_t>(),
-        num_rows,
-        static_cast<cudf::size_type>(string_col_offsets.size()));
+    // Gather the K chars totals and read them back with ONE copy and ONE sync instead of K
+    // element() round-trips.
+    rmm::device_uvector<size_type> dev_chars_sizes(num_string_columns, stream);
+    thrust::transform(
+      rmm::exec_policy(stream),
+      cuda::make_counting_iterator(0),
+      cuda::make_counting_iterator(num_string_columns),
+      dev_chars_sizes.begin(),
+      cuda::proclaim_return_type<size_type>([num_rows, offsets = dev_string_col_offsets] __device__(
+                                              auto const& i) { return offsets[i][num_rows]; }));
+    std::vector<size_type> chars_sizes(num_string_columns);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(chars_sizes.data(),
+                                  dev_chars_sizes.data(),
+                                  sizeof(size_type) * num_string_columns,
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    stream.synchronize();
+
+    // Destination chars buffers stay per-column: each one is released into its own strings
+    // column below. The chars total feeds the engine pick, at no extra sync.
+    int64_t total_string_chars = 0;
+    for (size_type i = 0; i < num_string_columns; ++i) {
+      total_string_chars += chars_sizes[i];
+      string_data_cols.emplace_back(chars_sizes[i], stream, mr);
+      string_data_col_ptrs.push_back(string_data_cols.back().data());
+    }
+
+    // third arena upload: the chars pointers only exist after the sized allocations above
+    auto* const dev_string_data_cols = std::get<0>(arena.upload(string_data_col_ptrs));
+
+    // Engine pick mirrors cudf's strings-gather: short strings fill warps better with dense
+    // per-byte stores, long strings amortize aligned 16B vector stores across a warp.
+    if (num_rows > 0) {
+      auto const avg_string_length =
+        total_string_chars / (static_cast<int64_t>(num_rows) * num_string_columns);
+      // dim3.y caps at 65535; the kernels column-stride past it (never expected in practice)
+      auto const grid_y = static_cast<uint32_t>(std::min(num_string_columns, 65535));
+      if (avg_string_length > STRING_COPY_AVG_LEN_SWITCH) {
+        dim3 const string_parallel_grid(
+          std::min(cudf::util::div_rounding_up_safe(num_rows, STRING_COPY_WARPS_PER_BLOCK),
+                   MAX_STRING_COPY_BLOCKS),
+          grid_y);
+        detail::copy_strings_from_rows_string_parallel<<<string_parallel_grid,
+                                                         STRING_COPY_BLOCK_SIZE,
+                                                         0,
+                                                         stream.value()>>>(offset_functor,
+                                                                           dev_string_row_offsets,
+                                                                           dev_string_col_offsets,
+                                                                           dev_string_data_cols,
+                                                                           child.data<int8_t>(),
+                                                                           num_rows,
+                                                                           num_string_columns);
+      } else {
+        auto const strings_per_block = STRING_COPY_STRINGS_PER_BLOCK;
+        auto* const char_parallel_kernel =
+          strings_per_block == 64
+            ? &detail::copy_strings_from_rows_char_parallel<64, decltype(offset_functor)>
+            : &detail::copy_strings_from_rows_char_parallel<32, decltype(offset_functor)>;
+        dim3 const char_parallel_grid(cudf::util::div_rounding_up_safe(num_rows, strings_per_block),
+                                      grid_y);
+        char_parallel_kernel<<<char_parallel_grid, STRING_COPY_BLOCK_SIZE, 0, stream.value()>>>(
+          offset_functor,
+          dev_string_row_offsets,
+          dev_string_col_offsets,
+          dev_string_data_cols,
+          child.data<int8_t>(),
+          num_rows,
+          num_string_columns);
+      }
+    }
 
     // merge strings back into output_columns
     int string_idx = 0;
