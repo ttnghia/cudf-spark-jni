@@ -670,17 +670,23 @@ TEST_F(ColumnToRowTests, DISABLED_HugeStringRowThrows)
   EXPECT_THROW(spark_rapids_jni::convert_to_rows(in), cudf::logic_error);
 }
 
-// Regression repro for spark-rapids-jni#4588. Disabled by default for the same memory reason as
-// HugeStringRowThrows.
+// Regression repro for spark-rapids-jni#4588. Disabled by default because it needs roughly 7 GB of
+// free GPU memory.
 //
 // The old kernel launch passed batch_num_rows (a per-batch count) as the kernel's `num_rows`
 // while start_row was an absolute index, so all batches whose start lay past the per-batch
 // count silently produced uninitialized output. The fix passes batch_row_offset +
 // batch_num_rows as the absolute end bound; this test exercises the multi-batch path.
+//
+// Sizing: two 20 MiB string columns give an ~40 MiB JCUDF row (string bytes dominate), so
+// floor(INT32_MAX / 40 MiB) = 51 >= 32 rows fit a batch and build_batches never trips the
+// "fewer than 32 rows" throw (the earlier 33 MiB columns left only 31 rows per batch, throwing
+// before the multi-batch path could run). 64 rows * ~40 MiB = ~2.5 GiB > the 2 GiB batch limit,
+// splitting into exactly two 32-row batches.
 TEST_F(ColumnToRowTests, DISABLED_MultiBatchStringDoesNotSkip)
 {
-  constexpr std::size_t per_col_bytes = 33ULL * 1024 * 1024;
-  constexpr int num_rows              = 35;
+  constexpr std::size_t per_col_bytes = 20ULL * 1024 * 1024;
+  constexpr int num_rows              = 64;
 
   std::vector<std::string> data_a, data_b;
   data_a.reserve(num_rows);
@@ -698,7 +704,7 @@ TEST_F(ColumnToRowTests, DISABLED_MultiBatchStringDoesNotSkip)
 
   auto rows = spark_rapids_jni::convert_to_rows(in);
   ASSERT_GE(rows.size(), 2u) << "Expected multiple batches; if a single batch fits the issue "
-                                "cannot be reproduced — increase per_col_bytes or num_rows.";
+                                "cannot be reproduced — increase num_rows.";
 
   // Reconstruct each batch and compare against the matching row slice of the input.
   std::size_t row_start = 0;
