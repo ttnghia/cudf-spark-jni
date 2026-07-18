@@ -2480,8 +2480,19 @@ namespace {
 void fixup_null_counts(std::vector<std::unique_ptr<column>>& output_columns,
                        rmm::cuda_stream_view stream)
 {
-  for (auto& col : output_columns) {
-    col->set_null_count(cudf::null_count(col->view().null_mask(), 0, col->size(), stream));
+  if (output_columns.empty()) { return; }
+  // All from-rows output columns share one row count, so a single cudf::batch_null_count (one
+  // kernel + one D2H sync) replaces a blocking cudf::null_count round-trip per column.
+  auto const num_rows = output_columns.front()->size();
+  std::vector<bitmask_type const*> masks;
+  masks.reserve(output_columns.size());
+  for (auto const& col : output_columns) {
+    CUDF_EXPECTS(col->size() == num_rows, "Batched null count requires equally sized columns");
+    masks.push_back(col->view().null_mask());
+  }
+  auto const null_counts = cudf::batch_null_count(masks, 0, num_rows, stream);
+  for (std::size_t i = 0; i < output_columns.size(); ++i) {
+    output_columns[i]->set_null_count(null_counts[i]);
   }
 }
 
