@@ -1994,7 +1994,36 @@ void determine_tiles(std::vector<size_type> const& column_sizes,
   auto const optimal_square_len  = static_cast<size_type>(sqrt(shmem_limit_per_tile));
   auto const desired_tile_height = cudf::util::round_up_safe<int>(
     std::min(optimal_square_len / square_bias, total_number_of_rows), cudf::detail::warp_size);
-  auto const tile_height = std::clamp(desired_tile_height, 1, first_row_batch_size);
+
+  // First pass: the total padded row size, accumulated exactly like the column march below so the
+  // single-band test agrees with what the march would build.
+  int total_row_size = 0;
+  for (auto const col_size : column_sizes) {
+    total_row_size = cudf::util::round_up_unsafe(total_row_size, col_size) + col_size;
+  }
+  total_row_size = cudf::util::round_up_unsafe(total_row_size, JCUDF_ROW_ALIGNMENT);
+
+  // Schema-adaptive fill-driven height: when the whole row fits a single tile at the square-bias
+  // height, most of the shared-memory budget goes unused, so grow the tile downward to fill the
+  // budget and shrink the grid. The min-grid guard keeps roughly two tiles per SM so small tables
+  // still cover the whole GPU; multi-band (wide) schemas keep the incumbent height.
+  auto adaptive_tile_height = desired_tile_height;
+  if (total_number_of_rows > 0 && total_row_size > 0 &&
+      total_row_size * desired_tile_height <= shmem_limit_per_tile) {
+    constexpr int min_grid_tiles_per_sm = 2;
+    auto const fill_height = cudf::util::round_down_safe<int>(shmem_limit_per_tile / total_row_size,
+                                                              cudf::detail::warp_size);
+    int device_id;
+    CUDF_CUDA_TRY(cudaGetDevice(&device_id));
+    int num_sms;
+    CUDF_CUDA_TRY(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id));
+    auto const guard_height = std::max(
+      cudf::detail::warp_size,
+      cudf::util::round_down_safe<int>(total_number_of_rows / (min_grid_tiles_per_sm * num_sms),
+                                       cudf::detail::warp_size));
+    adaptive_tile_height = std::min(fill_height, guard_height);
+  }
+  auto const tile_height = std::clamp(adaptive_tile_height, 1, first_row_batch_size);
 
   int row_size = 0;
 
