@@ -81,10 +81,7 @@ WARNING: CMAKE_CUDA_ARCHITECTURES is overridden by GPU_ARCHS.
 =========================================================================================="
 fi
 
-#
-# Function to create symlink to compile_commands.json for IDE/clangd discovery
-# (similar to NVBenchClangdCompileInfo.cmake)
-#
+# Symlink compile_commands.json into the source tree for IDE/clangd discovery.
 create_compile_commands_symlink() {
   local build_dir=$1
   local source_dir=$2
@@ -95,36 +92,27 @@ create_compile_commands_symlink() {
   ln -sf "$compile_commands_file" "$compile_commands_link"
 }
 
-# Generated ONCE per run and stamped into BOTH prebuilt-fingerprint manifests below: equal nonces
-# prove the install/libcudfjni pair came from the SAME seed run. Robust where a git-less cudf
-# source records cudf_sha=unknown on both sides (unknown==unknown would pass vacuously).
+# One nonce per run, stamped into both manifests: equal nonces prove the install/libcudfjni pair
+# came from one seed run. Used over cudf_sha, which is "unknown" for a git-less source.
 SEED_NONCE="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
 
-# Dependency-skew guard rationale: a dimension is ENFORCED (a cmp. key, diffed on reuse) iff the
-# consumer's phase-3 build can silently DIVERGE from the prebuilt libs on it (ODR/ABI corruption).
-#   cmp.pins_sha256  - the four tracked thirdparty/cudf-pins files (versions.json, setup.cmake,
-#                      add_dependency_pins.cmake, rapids-cmake.sha), hashed by explicit name so a
-#                      stray untracked file cannot cause spurious skew. Phase 3 fetches these
-#                      pinned dependencies ITSELF, so pin skew compiles against different dep
-#                      versions than the ones inside the prebuilt libs.
-#   cmp.ptds         - CUDF_USE_PER_THREAD_DEFAULT_STREAM is a PUBLIC compile definition; mixing
-#                      per-thread and legacy default-stream objects splits stream semantics.
-#   cmp.cuda_archs   - device code built for different real archs cannot link/run reliably.
-#   cmp.use_gds      - gates the cuFile code paths and the libcufilejni.a link.
-#   cmp.rmm_logging  - a macro baked into the rmm/cudf headers that phase 3 recompiles.
-#   cmp.build_type   - the prebuilt libcudf's CMAKE_BUILD_TYPE (phase 3 itself defaults to
-#                      Release).
-#   cmp.dep_mode     - reuse requires pinned dependencies; "latest" resolves differently per day.
-#   cmp.cuda_toolkit - the CUDA toolkit drives device ABI and the statically linked CUDA runtime.
-# NOT enforced: the cudf source/commit - a skew fails LOUDLY at phase-3 link or as a test-runtime
-# UnsatisfiedLinkError, so reuse only WARNS on it (the cudf_sha warning in the reuse validation);
-# nvcomp - baked into the prebuilt install's cmake export, consumed wholesale, cannot diverge;
-# Arrow/Parquet - linked wholesale from the one prebuilt _deps tree. Everything else in the
-# manifest (seed_nonce, cudf_sha, toolchain versions, date) is RECORD-only provenance.
+# Skew-guard rationale: enforce a dimension (a cmp. key, diffed on reuse) iff phase 3 can diverge
+# from the prebuilt silently (ODR/ABI). Enforced keys and why:
+#   pins_sha256  - the 4 tracked cudf-pins files (hashed by name); phase 3 fetches these deps.
+#   ptds         - public compile define; mixing per-thread/legacy splits stream semantics.
+#   cuda_archs   - device code for different real archs can't link/run.
+#   use_gds      - gates the cuFile paths and the libcufilejni.a link.
+#   rmm_logging  - macro baked into the rmm/cudf headers phase 3 recompiles.
+#   build_type   - the prebuilt libcudf's CMAKE_BUILD_TYPE.
+#   dep_mode     - reuse needs "pinned"; "latest" drifts daily.
+#   cuda_toolkit - device ABI + statically linked CUDA runtime.
+# Not enforced: cudf source/commit fails loudly (phase-3 link or runtime UnsatisfiedLinkError), so
+# only warned; nvcomp + Arrow/Parquet are consumed wholesale. seed_nonce/cudf_sha/toolchain/date
+# are RECORD-only.
 cudf_fingerprint_compare_lines() {
   local pins_sha cuda_toolkit
-  # Hash only the per-file digest column: sha256sum's raw output embeds absolute paths, which
-  # differ between the seed and consumer trees and would fake skew on identical pin contents.
+  # Hash only the digest column (cut -f1): sha256sum's raw output embeds absolute paths that
+  # differ between seed and consumer trees, faking skew on identical pins.
   pins_sha="$(set -o pipefail; sha256sum \
     "$CUDF_PIN_PATH/versions.json" \
     "$CUDF_PIN_PATH/setup.cmake" \
@@ -147,9 +135,8 @@ cudf_fingerprint_compare_lines() {
   echo "cmp.cuda_toolkit=$cuda_toolkit"
 }
 
-# Write one prebuilt-fingerprint manifest: the enforced cmp. lines plus RECORD-only provenance.
-# Single-shot overwrite (one printf, ">"): rebuilding a tree REPLACES its manifest; appending
-# would duplicate cmp./seed_nonce lines and break the reuse check's single-line greps.
+# Write one manifest: the cmp. lines plus RECORD-only provenance. Single-shot overwrite (">"), so
+# a rebuild replaces it; appending would duplicate lines and break the reuse check's single greps.
 cudf_fingerprint_stamp() {
   local manifest="$1" content cudf_sha gcc_ver nvcc_ver
   cudf_sha="$(git -C "$CUDF_PATH" rev-parse HEAD 2>/dev/null)" || cudf_sha=unknown
@@ -167,8 +154,8 @@ cudf_fingerprint_stamp() {
   printf '%s\n' "$content" > "$manifest"
 }
 
-# Reuse validation: when skipping phases 1+2, fail fast (here, not at phase-3 link) if the
-# prebuilt trees are incomplete for this build config or fingerprint-skewed vs this worktree.
+# Reuse validation: fail fast here (not at phase-3 link) if the prebuilt trees are incomplete for
+# this build config or fingerprint-skewed vs this worktree.
 if [[ "$LIBCUDF_REUSE_PREBUILT" == "true" ]]; then
   LIBCUDF_A="$LIBCUDF_INSTALL_PATH/lib64/libcudf.a"
   [[ -f "$LIBCUDF_A" ]] || LIBCUDF_A="$LIBCUDF_INSTALL_PATH/lib/libcudf.a"
@@ -179,9 +166,8 @@ if [[ "$LIBCUDF_REUSE_PREBUILT" == "true" ]]; then
     || { echo "ERROR: no prebuilt libcudfjni.a at $LIBCUDFJNI_BUILD_PATH" >&2; exit 1; }
   [[ -f "$LIBCUDFJNI_BUILD_PATH/_deps/arrow-build/release/libarrow.a" ]] \
     || { echo "ERROR: incomplete libcudfjni _deps (arrow)" >&2; exit 1; }
-  # jar packaging copies libnvcomp*.so from the libcudfjni tree (pom.xml copy-native-libs);
-  # copy-resources does NOT fail on absent includes, so a trimmed prebuilt would ship a jar
-  # silently lacking nvcomp.
+  # jar packaging copies libnvcomp*.so from here (pom.xml copy-native-libs) but does not fail if
+  # absent, so a trimmed prebuilt would silently ship a jar without nvcomp.
   [[ -f "$LIBCUDFJNI_BUILD_PATH/libnvcomp.so" ]] \
     || { echo "ERROR: prebuilt libcudfjni missing libnvcomp.so (jar packaging)" >&2; exit 1; }
   if [[ "$BUILD_TESTS" == "ON" || "$BUILD_BENCHMARKS" == "ON" ]]; then
@@ -210,13 +196,11 @@ if [[ "$LIBCUDF_REUSE_PREBUILT" == "true" ]]; then
       fi
     fi
   done
-  # Mismatched-pair guard: the two trees must come from the SAME seed run, else libcudfjni.a was
-  # built against different cudf headers than libcudf.a (the silent ODR class this guard exists
-  # for). Compare seed_nonce, NOT cudf_sha: a copied git-less source makes cudf_sha "unknown" in
-  # both trees and unknown==unknown would pass vacuously; a per-run nonce cannot collide across
-  # seed runs. The "|| { ...; exit 1; }" on each grep is required: under set -e a bare
-  # n=$(grep ...) that matches nothing aborts messagelessly; a manifest lacking seed_nonce is
-  # corrupt/old, so error explicitly instead.
+  # Mismatched-pair guard: both trees must come from ONE seed run, else libcudfjni.a was built
+  # against different cudf headers than libcudf.a (silent ODR). Compare seed_nonce, not cudf_sha:
+  # a git-less source makes cudf_sha "unknown" on both, passing vacuously. The "|| exit" on each
+  # grep is required under set -e: a bare n=$(grep) matching nothing aborts silently; treat a
+  # manifest without seed_nonce as corrupt.
   n1="$(grep '^seed_nonce=' "$m1")" \
     || { echo "ERROR: $m1 missing seed_nonce (corrupt/old manifest); re-seed" >&2; exit 1; }
   n2="$(grep '^seed_nonce=' "$m2")" \
@@ -230,11 +214,9 @@ if [[ "$LIBCUDF_REUSE_PREBUILT" == "true" ]]; then
       exit 1
     fi
   fi
-  # Non-enforcing cudf-SOURCE skew WARNING (enforce jni pins, not cudf): the Maven jar compiles
-  # cudf Java and phase 3 compiles JNI/bench TUs from CUDF_PATH; if its commit differs from the
-  # prebuilt's recorded cudf_sha, the native/JNI surface can diverge from the prebuilt libs,
-  # surfacing loudly later (phase-3 link error, or a test-runtime UnsatisfiedLinkError). Warn
-  # EARLY; never block.
+  # Non-enforcing cudf-source skew warning (enforce jni pins, not cudf): if CUDF_PATH's commit
+  # differs from the prebuilt's cudf_sha, the native/JNI surface may diverge but fails loudly
+  # later (phase-3 link or a runtime UnsatisfiedLinkError). Warn early; never block.
   consumer_sha="$(git -C "$CUDF_PATH" rev-parse HEAD 2>/dev/null || echo unknown)"
   prebuilt_sha="$(grep '^cudf_sha=' "$m1" | head -1)"
   prebuilt_sha="${prebuilt_sha#cudf_sha=}"
@@ -249,8 +231,7 @@ fi
 # libcudf build
 #
 if [[ "$LIBCUDF_REUSE_PREBUILT" == "true" ]]; then
-  # Also bypasses the legacy LIBCUDF_CONFIGURE_ONLY early-exit below - intended: in reuse there
-  # is no cudf build to configure.
+  # Reuse also bypasses the legacy LIBCUDF_CONFIGURE_ONLY early-exit: no cudf build to configure.
   echo "Skipping libcudf build; reusing $LIBCUDF_INSTALL_PATH"
 else
   mkdir -p "$LIBCUDF_INSTALL_PATH" "$LIBCUDF_BUILD_PATH"
@@ -321,12 +302,10 @@ fi
 #
 # sparkjni build
 #
-# Persisted phase-3 build dirs (target/ survives across dispatches) pin stale trees: CMake never
-# re-runs a find_library/find_package whose cache entry already holds a valid path, so on a
-# CUDF_DIR/CUDF_INSTALL_DIR/CUDFJNI_BUILD_DIR change EVERY find_library output (CUDFJNI_LIB,
-# ARROW_LIB/PARQUET_LIB, CUFILEJNI_LIB, et al.), the find_package dirs, and other derived cache
-# entries would keep resolving the OLD trees. Wipe the build dir on any trio mismatch so the
-# configure below re-derives them all; no cache file (first build) means nothing stale to wipe.
+# Persisted phase-3 build dirs pin stale trees: CMake never re-runs a find_library/find_package
+# whose cache holds a valid path, so on a CUDF_DIR/CUDF_INSTALL_DIR/CUDFJNI_BUILD_DIR change the
+# derived entries (CUDFJNI_LIB, ARROW_LIB, find_package dirs, ...) keep resolving the OLD trees.
+# Wipe the build dir on a trio mismatch so the configure re-derives them; no cache means no wipe.
 SPARK_JNI_CACHE="$SPARK_JNI_BUILD_PATH/CMakeCache.txt"
 if [[ -f "$SPARK_JNI_CACHE" ]]; then
   cached_cudf_dir="$(grep '^CUDF_DIR:' "$SPARK_JNI_CACHE" | cut -d= -f2-)" || cached_cudf_dir=""
@@ -344,8 +323,8 @@ fi
 mkdir -p "$SPARK_JNI_BUILD_PATH"
 cd "$SPARK_JNI_BUILD_PATH"
 echo "Configuring spark-rapids-jni native libs"
-# The trio -D below pre-creates the env-seeded set(CACHE) entries (which never overwrite an
-# existing cache value), so the current paths always win over a persisted CMakeCache.txt.
+# The trio -D pre-creates the env-seeded set(CACHE) entries (which never overwrite an existing
+# value), so the current paths win over a persisted CMakeCache.txt.
 CUDF_ROOT="$CUDF_PATH" \
   CUDF_INSTALL_DIR="$LIBCUDF_INSTALL_PATH" \
   CUDFJNI_BUILD_DIR="$LIBCUDFJNI_BUILD_PATH" \
