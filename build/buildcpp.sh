@@ -90,7 +90,7 @@ create_compile_commands_symlink() {
   local source_dir=$2
   local compile_commands_file="$build_dir/compile_commands.json"
   local compile_commands_link="$source_dir/compile_commands.json"
-  
+
   echo "Creating symlink from $compile_commands_link to $compile_commands_file..."
   ln -sf "$compile_commands_file" "$compile_commands_link"
 }

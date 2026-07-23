@@ -108,18 +108,17 @@ to control aspects of the build:
 
 ### Reusing a pre-built libcudf
 
-Building this project normally rebuilds libcudf and libcudfjni from the cudf source on every
-build — the slow part. When several local checkouts build the same cudf commit, one checkout can
-build them once and the others can reuse the result with `-Dlibcudf.reuse.prebuilt=true`, so that
-only the cudf-spark-jni native code and the jar are rebuilt. Reuse takes BOTH the cudf source
-and the cudf prebuilt:
+Building this project normally rebuilds libcudf and libcudfjni from cudf source on every
+build. When several local checkouts build the same cudf commit, one checkout can
+build them once and the others can reuse the result with `-Dlibcudf.reuse.prebuilt=true`, which
+can significantly reduce the total build time. Reuse requires BOTH the cudf source and the prebuilt:
 
 * **cudf source** — `-Dcudf.path=<dir>`: a populated `thirdparty/cudf` submodule or any cudf
-  checkout. The Maven build compiles cudf's Java classes from it, and the native build reads its
-  CMake configuration and headers.
+  checkout. The source is still required because Maven build of this project always compiles
+  cudf's Java classes from it, and the native build reads its CMake configuration and headers.
 * **cudf prebuilt** — `-Dlibcudf.install.path=<dir>` (a libcudf install tree) plus
-  `-Dlibcudfjni.build.path=<dir>` (a libcudfjni build tree), both produced together by a previous
-  normal build.
+  `-Dlibcudfjni.build.path=<dir>` (a libcudfjni build tree, produced by compiling cudf-java native
+  sources), both produced together by a previous normal build.
 
 ```bash
 mvn package -Dlibcudf.reuse.prebuilt=true \
@@ -130,72 +129,46 @@ mvn package -Dlibcudf.reuse.prebuilt=true \
 
 Reuse automatically skips the git submodule check and the cudf patch steps, so no
 `-Dsubmodule.check.skip` or patch-skip flags are needed — the build works even when the
-`thirdparty/cudf` submodule is empty, because in reuse the submodule is never built from (the
-source named by `-Dcudf.path` is what is read).
-
-Reuse recompiles no cudf code. It links the pre-built `libcudf.a` and `libcudfjni.a` (plus the
-Arrow/Parquet libraries and nvcomp shipped inside the prebuilt trees). With `-DBUILD_TESTS=ON` or
-`-DBUILD_BENCHMARKS=ON` it compiles the test-utility sources installed in the prebuilt
-(`src/cudftestutil/`) and links `libcudftest_default_stream.a`; benchmarks compile this
-repository's own vendored data generator, never cudf's.
+`thirdparty/cudf` submodule is empty. No cudf code will be recompiled, only the pre-built
+`libcudf.a`, `libcudfjni.a` plus other dependency libraries shipped inside the prebuilt trees
+will be used during the linking step.
 
 Notes:
 
-* **Matching the cudf source to the prebuilt is your responsibility.** `-Dcudf.path` may point at
-  any cudf commit, but it must be the commit the prebuilt was built from. A mismatch is never
-  silent: reuse warns early (without failing) when the `cudf.path` HEAD differs from the cudf
-  commit recorded in the prebuilt, and a real divergence fails loudly at the cudf-spark-jni link
-  step (undefined symbols) or at test runtime with an `UnsatisfiedLinkError`.
+* **Matching the cudf source to the prebuilt is your responsibility.** `-Dcudf.path` should point
+  to the commit that the prebuilt was built from. If the `cudf.path` HEAD differs from the cudf
+  commit recorded in the prebuilt, a warning will be issued. Here, issuing a warning instead of error is
+  deliberate to allow using different cudf commits with the changes between them are minor or unrelated
+  to this project (such as changes only in the python module). Abusing this by reusing incompatible
+  commit would result in link time issue or runtime crash.
 * **Tests and benchmarks need a test-enabled prebuilt.** If the prebuilt was built without them, a
-  reuse build that requests tests or benchmarks stops with a clear error asking for the prebuilt
-  to be rebuilt with tests enabled — not with a confusing link failure.
-* **No `mvn clean` is needed when toggling reuse on or off.** `build/buildcpp.sh` detects when the
-  cudf source or prebuilt paths differ from the previous build's CMake cache and automatically
-  wipes and reconfigures the cudf-spark-jni build directory.
-* **Trimming a prebuilt by hand:** from the install tree keep `libcudf.a`, the `lib*/cmake/cudf`
-  CMake exports, the `include/cudf`, `include/cudf_test`, and `include/nvtext` headers, and (for
-  tests/benchmarks) `libcudftest_default_stream.a` plus the installed `src/cudftestutil/` sources.
-  Keep the libcudfjni tree wholesale: `libcudfjni.a`, the static libraries under its `lib/`, its
-  `_deps` directory, `libnvcomp*.so`, and `libcufilejni.a` when built with `USE_GDS=ON`.
-  Over-trimming any of these fails loudly at the cudf-spark-jni configure or link step
-  (`find_library` / `find_package(cudf)`), never silently.
+  reuse build that requests tests or benchmarks will fail to link because they need a test-utility
+  library compiled from the test module.
 
 #### Dependency-skew guard
 
-The CMake `find_package(cudf)` request carries no version requirement, so CMake alone would not
-catch a prebuilt built from different dependency pins or ABI-affecting options. Instead, every
-normal build stamps a `cudf-prebuilt-fingerprint.txt` manifest into both prebuilt trees, and a
-reuse build recomputes the fingerprint from the current checkout and refuses a prebuilt that does
-not match. The two trees must also come from the same build — a libcudf/libcudfjni pair spliced
-from different builds is refused, since its `libcudfjni.a` was built against different cudf
-headers than its `libcudf.a`. The rule, also documented alongside the fingerprint code in
-`build/buildcpp.sh`: a dimension is enforced only if this build could silently diverge from the
-prebuilt on it (an ODR/ABI hazard); anything consumed wholesale from the prebuilt, or anything
-that already fails loudly, is not enforced.
+To enforce a prebuilt to have the same dependency pins and ABI-affecting options as the current build, every
+normal build generates a `cudf-prebuilt-fingerprint.txt` manifest in prebuilt trees of cudf and cudf-java.
+A reuse build recomputes the fingerprints from the current checkout to validate against the prebuilt's
+fingerprints. If no such fingerprints are found or the prebuilt fingerprints do not match, an error
+will be thrown.
 
-| Enforced dimension | Build input | Why it must match |
-|--------------------|-------------|-------------------|
-| `pins_sha256` | the four tracked `thirdparty/cudf-pins` files | the build fetches its own dependencies from these pins; a pin skew against the prebuilt's dependencies is a silent ODR violation |
-| `ptds` | `CUDF_USE_PER_THREAD_DEFAULT_STREAM` | public compile definition; code compiled here must use the same stream mode as the prebuilt |
-| `cuda_archs` | `CMAKE_CUDA_ARCHITECTURES` | the prebuilt's device code must cover the GPU architectures this build targets |
-| `use_gds` | `USE_GDS` | gates whether `libcufilejni.a` exists in the prebuilt and is linked |
-| `rmm_logging` | `RMM_LOGGING_LEVEL` | logging macro compiled into code through the installed RMM headers |
-| `build_type` | `CUDF_BUILD_TYPE` | build type is ABI-affecting; the prebuilt libcudf must have the type this build requests |
-| `dep_mode` | `LIBCUDF_DEPENDENCY_MODE` | reuse requires `pinned` so the pins fingerprint actually describes the dependencies; `latest` is refused |
-| `cuda_toolkit` | CUDA toolkit (`nvcc`) version | objects compiled by a different CUDA toolkit are not guaranteed ABI-compatible with the prebuilt |
+The build parameters enforced in fingerprints include:
+* CUDA toolkit (`nvcc`) version
+* The four tracked `thirdparty/cudf-pins` files
+* `CUDF_USE_PER_THREAD_DEFAULT_STREAM`
+* `CMAKE_CUDA_ARCHITECTURES`
+* `USE_GDS`
+* `RMM_LOGGING_LEVEL`
+* `CUDF_BUILD_TYPE`
+* `LIBCUDF_DEPENDENCY_MODE`, must be `pinned`
 
-Deliberately NOT enforced:
+Note that a reuse build requires `LIBCUDF_DEPENDENCY_MODE` set to `pinned` so the dependencies stay
+consistent over time.
 
-* **cudf source/commit** — a source-vs-prebuilt mismatch already fails loudly (a link error or an
-  `UnsatisfiedLinkError`) and triggers the early warning above.
-* **nvcomp** — baked into the prebuilt install's CMake export; a reuse build cannot diverge from
-  it.
-* **Arrow/Parquet** — consumed wholesale from the single prebuilt `_deps` tree; a reuse build
-  cannot diverge from them.
-
-**Warning:** `-Dlibcudf.reuse.force=true` downgrades a fingerprint or pair mismatch to a warning
-and builds anyway (reuse still requires `pinned` dependency mode and stamped manifests); the
-result is then entirely your responsibility.
+**Warning:** `-Dlibcudf.reuse.force=true` downgrades any dependency mismatch to a warning
+and builds anyway (still requires dependency mode to set to `pinned` and stamped manifests
+exist).
 
 
 ### Local testing of cross-repo contributions cudf, spark-rapids-jni, and spark-rapids
