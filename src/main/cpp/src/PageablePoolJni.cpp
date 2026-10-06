@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION.
+ * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@
 
 #include <cuda/memory_resource>
 
+// Exhaustion returns -1 WITHOUT a Java exception (the caller's null-fallback signal);
+// all other failures return ret_val (0) with a pending Java exception.
 #define CATCH_PAGEABLE_POOL_EXHAUSTED(env, ret_val)                        \
   JNI_CATCH_BEGIN(env, ret_val)                                            \
   catch (spark_rapids_jni::pageable_pool_exhausted const&)                 \
@@ -31,15 +33,18 @@
 extern "C" {
 
 JNIEXPORT jlong JNICALL Java_ai_rapids_cudf_PageableMemoryPool_newPageablePoolMemoryResource(
-  JNIEnv* env, jclass, jlong pool_size, jint pretouch_threads)
+  JNIEnv* env, jclass, jlong pool_size, jint pretouch_threads, jboolean numa_bind)
 {
   JNI_TRY
   {
-    auto* pool = new spark_rapids_jni::pageable_pool_resource(
+    cudf::jni::auto_set_device(env);
+    int const numa_node = (numa_bind != JNI_FALSE) ? spark_rapids_jni::detail::gpu_numa_node() : -1;
+    auto* pool          = new spark_rapids_jni::pageable_pool_resource(
       cuda::mr::any_synchronous_resource<cuda::mr::host_accessible>(
         spark_rapids_jni::pageable_memory_resource{}),
       static_cast<std::size_t>(pool_size),
-      static_cast<int>(pretouch_threads));
+      static_cast<int>(pretouch_threads),
+      numa_node);
     return reinterpret_cast<jlong>(pool);
   }
   JNI_CATCH(env, 0);
